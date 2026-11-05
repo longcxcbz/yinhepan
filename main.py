@@ -24,13 +24,11 @@ logging.basicConfig(
 # 🔐 私人专属配置
 # ==========================================
 BOT_USERNAME = "Yinhepan_bot"  # 你的自用机器人用户名
-
-# 💡 【重要安全设置】：为了防止别人误用你的机器人，请在这里填入你自己的 Telegram 数字 ID
-ADMIN_USER_ID = 0  # 例如: 123456789 (你可以先运行一次，看后台日志打印的 User ID 填进来)
+ADMIN_USER_ID = 0  # 填入你的 Telegram 数字 ID（若不确定可先留0，看日志绑定）
 # ==========================================
 
 # ==========================================
-# 0. 初始化 SQLite 数据库（用于永久存档）
+# 0. 初始化 SQLite 数据库
 # ==========================================
 DB_FILE = "private_database.db"
 
@@ -110,7 +108,7 @@ def run_web_server():
 threading.Thread(target=run_web_server, daemon=True).start()
 
 # ==========================================
-# 2. 接收文件（仅限主人上传，支持动态暂存）
+# 2. 接收文件（仅限主人上传）
 # ==========================================
 async def handle_incoming_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -164,7 +162,7 @@ async def handle_incoming_media(update: Update, context: ContextTypes.DEFAULT_TY
         UPLOADING_SESSIONS[chat_id]["msg_id"] = sent_msg.message_id
 
 # ==========================================
-# 3. 按钮回调（完成打包 / 后台复查操作）
+# 3. 按钮回调（打包入库 + 自动向你发送 .db 备份文件）
 # ==========================================
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -192,10 +190,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔑 存档识别码：`{short_code}`\n\n"
             f"🔗 **提取链接**：\n"
             f"[点击直达提取文件]({raw_link})\n\n"
-            f"💡 发送 `/glwj` 可以随时进入后台复查和管理历史存档。"
+            f"🛡️ **数据库已自动备份至您的聊天窗口**"
         )
         
-        # 💡 包含一键提取、一键复制链接、后台管理按钮
         keyboard = [
             [InlineKeyboardButton("🔗 一键提取查看", url=raw_link)],
             [InlineKeyboardButton("📋 点击复制链接", copy_text=raw_link)],
@@ -204,6 +201,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         await query.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+        # 💡 【核心安全防线】：每次归档成功，自动将最新的数据库文件发送到聊天框
+        try:
+            if os.path.exists(DB_FILE):
+                with open(DB_FILE, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=chat_id,
+                        document=f,
+                        caption="📦 【云端数据库自动备份】妥善保存此文件，数据永不丢失。"
+                    )
+        except Exception as e:
+            logging.error(f"发送数据库备份失败: {e}")
 
     elif data == "goto_glwj":
         await show_glwj_panel(query.message, edit=True)
@@ -221,4 +230,103 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raw_link = f"https://t.me/{BOT_USERNAME}?start={short_code}"
             await query.message.reply_text(
                 f"📌 **存档复查详情**\n\n"
-                f"• 识别码：
+                f"• 识别码：`{short_code}`\n"
+                f"• 文件数量：{count} 个\n"
+                f"• 提取链接：\n`{raw_link}`",
+                parse_mode="Markdown"
+            )
+        else:
+            await query.message.reply_text("❌ 未找到该存档记录，可能已被删除。")
+
+# ==========================================
+# 4. 私人复查后台：/glwj 命令
+# ==========================================
+async def show_glwj_panel(message_obj, edit=False):
+    resources = db_get_all_resources()
+
+    if not resources:
+        text = "📂 目前私密云盘中还没有任何存档记录。"
+        if edit:
+            await message_obj.edit_text(text)
+        else:
+            await message_obj.reply_text(text)
+        return
+
+    text = f"🛠️ **私人云盘存档复查后台**\n共找到 {len(resources)} 组历史存档：\n\n"
+    keyboard = []
+
+    for item in resources:
+        code = item["short_code"]
+        count = item["count"]
+        time_str = item["created_at"][:16]
+        keyboard.append([
+            InlineKeyboardButton(f"📁 [{time_str}] 码:{code} ({count}个)", callback_data=f"view_{code}"),
+            InlineKeyboardButton("❌ 删除", callback_data=f"del_{code}")
+        ])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    if edit:
+        await message_obj.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+    else:
+        await message_obj.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+async def glwj_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
+        return
+    await show_glwj_panel(update.message, edit=False)
+
+# ==========================================
+# 5. 提取存档（/start 触发）
+# ==========================================
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    chat_id = update.effective_chat.id
+
+    if args:
+        short_code = args[0]
+        file_list = db_get_resource(short_code)
+
+        if file_list:
+            total = len(file_list)
+            await update.message.reply_text(f"🔍 正在为您调阅存档（共 {total} 个文件），正在下发中...")
+
+            for i in range(0, total, 10):
+                chunk = file_list[i:i+10]
+                media_group = []
+                for item in chunk:
+                    if item["type"] == "photo":
+                        media_group.端.append(InputMediaPhoto(media=item["file_id"])) if hasattr(InputMediaPhoto, "端") else media_group.append(InputMediaPhoto(media=item["file_id"]))
+                    elif item["type"] == "video":
+                        media_group.append(InputMediaVideo(media=item["file_id"]))
+
+                try:
+                    await context.bot.send_media_group(chat_id=chat_id, media=media_group)
+                except Exception as e:
+                    await update.message.reply_text(f"❌ 调阅文件出错: {e}")
+        else:
+            await update.message.reply_text("❌ 未找到该存档记录，可能已失效或被清理。")
+    else:
+        await update.message.reply_text("🔐 欢迎使用您的私人云盘复查机器人。直接发送图片或视频开始归档。")
+
+# ==========================================
+# 6. 主程序入口
+# ==========================================
+def main():
+    token = os.environ.get("TOKEN")
+    if not token:
+        print("错误: 未找到 TOKEN 环境变量！")
+        return
+
+    application = ApplicationBuilder().token(token).build()
+
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("glwj", glwj_command))
+    application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_incoming_media))
+    application.add_handler(CallbackQueryHandler(button_callback))
+
+    print("私人云盘复查机器人正在运行...")
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()
