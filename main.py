@@ -187,11 +187,16 @@ async def button_callback(
         UPLOADING_SESSIONS[chat_id] = {"files": [], "msg_id": None}
 
         raw_link = f"https://t.me/{BOT_USERNAME}?start={short_code}"
-        text = f"🎉 **归档成功！**\n📁 文件数：{len(session_files)}\n🔑 识别码：`{short_code}`\n\n🔗 提取链接：\n[点击直达]({raw_link})"
+        text = (
+            f"🎉 **归档成功！**\n"
+            f"📁 文件数：{len(session_files)}\n"
+            f"🔑 识别码：`{short_code}`\n\n"
+            f"🔗 **提取链接**（点击下方代码即可复制）：\n"
+            f"`{raw_link}`"
+        )
         
         keyboard = [
             [InlineKeyboardButton("🔗 一键提取查看", url=raw_link)],
-            [InlineKeyboardButton("📋 点击复制链接", copy_text=raw_link)],
             [InlineKeyboardButton("🛠️ 进入管理后台", callback_data="goto_glwj")]
         ]
         
@@ -201,13 +206,6 @@ async def button_callback(
             pass
 
         await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-
-        try:
-            if os.path.exists(DB_FILE):
-                with open(DB_FILE, "rb") as f:
-                    await context.bot.send_document(chat_id=chat_id, document=f, caption="📦 数据库自动备份")
-        except Exception:
-            pass
 
     elif data == "goto_glwj":
         await show_glwj_panel(query.message, edit=True)
@@ -229,6 +227,28 @@ async def glwj_command(
     if ADMIN_USER_ID != 0 and update.effective_user.id != ADMIN_USER_ID:
         return
     await show_glwj_panel(update.message, edit=False)
+
+# 💡 新增：手动获取数据库备份文件的命令
+async def backup_command(
+    update: Update, 
+    context: ContextTypes.DEFAULT_TYPE
+):
+    chat_id = update.effective_chat.id
+    if ADMIN_USER_ID != 0 and update.effective_user.id != ADMIN_USER_ID:
+        return
+    
+    if os.path.exists(DB_FILE):
+        try:
+            with open(DB_FILE, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=chat_id, 
+                    document=f, 
+                    caption="📦 【手动备份】这是您当前的数据库文件（private_database.db）。"
+                )
+        except Exception as e:
+            await update.message.reply_text(f"❌ 发送备份文件失败: {e}")
+    else:
+        await update.message.reply_text("❌ 当前还没有生成数据库文件。")
 
 async def start_command(
     update: Update, 
@@ -254,7 +274,7 @@ async def start_command(
         else:
             await update.message.reply_text("❌ 未找到该存档。")
     else:
-        await update.message.reply_text("🔐 私人云盘就绪。直接发送图片或视频开始归档。")
+        await update.message.reply_text("🔐 私人云盘就绪。直接发送图片或视频开始归档。\n\n💡 发送 `/backup` 即可随时打包下载当前的数据库文件。")
 
 def main():
     token = os.environ.get("TOKEN")
@@ -263,6 +283,7 @@ def main():
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("glwj", glwj_command))
+    app.add_handler(CommandHandler("backup", backup_command)) # 注册备份命令
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_incoming_media))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.run_polling()
