@@ -14,22 +14,10 @@ from telegram.ext import (
     filters,
 )
 
-# 开启日志
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-# ==========================================
-# 🔐 私人专属配置
-# ==========================================
-BOT_USERNAME = "Yinhepan_bot"  # 你的自用机器人用户名
-ADMIN_USER_ID = 0  # 填入你的 Telegram 数字 ID（若不确定可先留0，看日志绑定）
-# ==========================================
-
-# ==========================================
-# 0. 初始化 SQLite 数据库
-# ==========================================
+BOT_USERNAME = "Yinhepan_bot"
+ADMIN_USER_ID = 0
 DB_FILE = "private_database.db"
 
 def init_db():
@@ -50,8 +38,7 @@ init_db()
 def db_save_resource(short_code, file_list):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO resources (short_code, file_list) VALUES (?, ?)", 
-                   (short_code, json.dumps(file_list)))
+    cursor.execute("INSERT OR REPLACE INTO resources (short_code, file_list) VALUES (?, ?)", (short_code, json.dumps(file_list)))
     conn.commit()
     conn.close()
 
@@ -61,9 +48,7 @@ def db_get_resource(short_code):
     cursor.execute("SELECT file_list FROM resources WHERE short_code = ?", (short_code,))
     row = cursor.fetchone()
     conn.close()
-    if row:
-        return json.loads(row[0])
-    return None
+    return json.loads(row[0]) if row else None
 
 def db_get_all_resources():
     conn = sqlite3.connect(DB_FILE)
@@ -71,14 +56,7 @@ def db_get_all_resources():
     cursor.execute("SELECT short_code, file_list, created_at FROM resources ORDER BY created_at DESC")
     rows = cursor.fetchall()
     conn.close()
-    results = []
-    for row in rows:
-        results.append({
-            "short_code": row[0], 
-            "count": len(json.loads(row[1])),
-            "created_at": row[2]
-        })
-    return results
+    return [{"short_code": r[0], "count": len(json.loads(r[1])), "created_at": r[2]} for r in rows]
 
 def db_delete_resource(short_code):
     conn = sqlite3.connect(DB_FILE)
@@ -89,14 +67,11 @@ def db_delete_resource(short_code):
 
 UPLOADING_SESSIONS = {}
 
-# ==========================================
-# 1. 维持 Render 端口的网页服务器
-# ==========================================
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Private Bot is running!")
+        self.wfile.write(b"Bot is running!")
     def log_message(self, format, *args):
         return
 
@@ -107,21 +82,14 @@ def run_web_server():
 
 threading.Thread(target=run_web_server, daemon=True).start()
 
-# ==========================================
-# 2. 接收文件（仅限主人上传）
-# ==========================================
 async def handle_incoming_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message:
         return
-    
     chat_id = message.chat_id
     user_id = message.from_user.id
 
-    logging.info(f"收到来自用户 ID: {user_id} 的消息")
-
     if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
-        await message.reply_text("⛔ 这是一个私人专属机器人，您没有权限使用。")
         return
 
     if message.photo:
@@ -139,12 +107,7 @@ async def handle_incoming_media(update: Update, context: ContextTypes.DEFAULT_TY
     UPLOADING_SESSIONS[chat_id]["files"].append({"type": file_type, "file_id": file_id})
     total_count = len(UPLOADING_SESSIONS[chat_id]["files"])
 
-    text = (
-        f"📥 **正在归档私密文件中...**\n\n"
-        f"当前已累计暂存：**{total_count}** 个文件\n"
-        f"💡 发送完毕后，请点击下方按钮完成打包入库。"
-    )
-
+    text = f"📥 **正在归档...**\n已暂存：**{total_count}** 个文件"
     keyboard = [[InlineKeyboardButton("✅ 归档完毕，生成永久存档", callback_data="finish_group")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -154,16 +117,30 @@ async def handle_incoming_media(update: Update, context: ContextTypes.DEFAULT_TY
             sent_msg = await message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
             UPLOADING_SESSIONS[chat_id]["msg_id"] = sent_msg.message_id
         else:
-            await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=current_msg_id, text=text, reply_markup=reply_markup, parse_mode="Markdown"
-            )
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=current_msg_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
     except Exception:
         sent_msg = await message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
         UPLOADING_SESSIONS[chat_id]["msg_id"] = sent_msg.message_id
 
-# ==========================================
-# 3. 按钮回调
-# ==========================================
+async def show_glwj_panel(message_obj, edit=False):
+    resources = db_get_all_resources()
+    if not resources:
+        text = "📂 目前没有任何存档记录。"
+        if edit:
+            await message_obj.edit_text(text)
+        else:
+            await message_obj.reply_text(text)
+        return
+
+    text = f"🛠️ **存档复查后台**\n共找到 {len(resources)} 组存档："
+    keyboard = [[InlineKeyboardButton(f"📁 码:{i['short_code']} ({i['count']}个)", callback_data=f"view_{i['short_code']}"), InlineKeyboardButton("❌ 删除", callback_data=f"del_{i['short_code']}")] for i in resources]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if edit:
+        await message_obj.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+    else:
+        await message_obj.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -175,7 +152,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session_files = session_data["files"]
 
         if not session_files:
-            await query.message.reply_text("❌ 机器人刚才可能触发了云端休眠重启，暂存的文件已被刷新。请重新发送一次图片或视频即可！")
+            await query.message.reply_text("❌ 暂存文件已被刷新，请重新发送！")
             return
 
         short_code = session_files[0]["file_id"][-8:]
@@ -183,90 +160,69 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         UPLOADING_SESSIONS[chat_id] = {"files": [], "msg_id": None}
 
         raw_link = f"https://t.me/{BOT_USERNAME}?start={short_code}"
-
-        text = (
-            f"🎉 **私密归档成功！**\n\n"
-            f"📁 包含文件总数：{len(session_files)} 个\n"
-            f"🔑 存档识别码：`{short_code}`\n\n"
-            f"🔗 **提取链接**：\n"
-            f"[点击直达提取文件]({raw_link})\n\n"
-            f"🛡️ **数据库已自动备份至您的聊天窗口**"
-        )
+        text = f"🎉 **归档成功！**\n📁 文件数：{len(session_files)}\n🔑 识别码：`{short_code}`\n\n🔗 提取链接：\n[点击直达]({raw_link})"
         
         keyboard = [
             [InlineKeyboardButton("🔗 一键提取查看", url=raw_link)],
             [InlineKeyboardButton("📋 点击复制链接", copy_text=raw_link)],
-            [InlineKeyboardButton("🛠️ 进入管理/复查后台", callback_data="goto_glwj")]
+            [InlineKeyboardButton("🛠️ 进入管理后台", callback_data="goto_glwj")]
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await query.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
         try:
             if os.path.exists(DB_FILE):
                 with open(DB_FILE, "rb") as f:
-                    await context.bot.send_document(
-                        chat_id=chat_id,
-                        document=f,
-                        caption="📦 【云端数据库自动备份】妥善保存此文件，数据永不丢失。"
-                    )
-        except Exception as e:
-            logging.error(f"发送数据库备份失败: {e}")
+                    await context.bot.send_document(chat_id=chat_id, document=f, caption="📦 数据库自动备份")
+        except Exception:
+            pass
 
     elif data == "goto_glwj":
         await show_glwj_panel(query.message, edit=True)
-
     elif data.startswith("del_"):
-        short_code = data.split("_")[1]
-        db_delete_resource(short_code)
-        await query.message.edit_text(f"🗑️ 已成功从数据库中彻底抹除识别码为 `{short_code}` 的存档。", parse_mode="Markdown")
-
+        code = data.split("_")[1]
+        db_delete_resource(code)
+        await query.message.edit_text(f"🗑️ 已删除码 `{code}` 的存档。", parse_mode="Markdown")
     elif data.startswith("view_"):
-        short_code = data.split("_")[1]
-        file_list = db_get_resource(short_code)
+        code = data.split("_")[1]
+        file_list = db_get_resource(code)
         if file_list:
-            count = len(file_list)
-            raw_link = f"https://t.me/{BOT_USERNAME}?start={short_code}"
-            await query.message.reply_text(
-                f"📌 **存档复查详情**\n\n"
-                f"• 识别码：`{short_code}`\n"
-                f"• 文件数量：{count} 个\n"
-                f"• 提取链接：\n`{raw_link}`",
-                parse_mode="Markdown"
-            )
-        else:
-            await query.message.reply_text("❌ 未找到该存档记录，可能已被删除。")
+            raw_link = f"https://t.me/{BOT_USERNAME}?start={code}"
+            await query.message.reply_text(f"📌 存档 `{code}`\n数量：{len(file_list)}个\n链接：\n`{raw_link}`", parse_mode="Markdown")
 
-# ==========================================
-# 4. 私人复查后台：/glwj 命令
-# ==========================================
-async def show_glwj_panel(message_obj, edit=False):
-    resources = db_get_all_resources()
-
-    if not resources:
-        text = "📂 目前私密云盘中还没有任何存档记录。"
-        if edit:
-            await message_obj.edit_text(text)
-        else:
-            await message_obj.reply_text(text)
+async def glwj_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if ADMIN_USER_ID != 0 and update.effective_user.id != ADMIN_USER_ID:
         return
+    await show_glwj_panel(update.message, edit=False)
 
-    text = f"🛠️ **私人云盘存档复查后台**\n共找到 {len(resources)} 组历史存档：\n\n"
-    keyboard = []
-
-    for item in resources:
-        code = item["short_code"]
-        count = item["count"]
-        time_str = item["created_at"][:16]
-        keyboard.append([
-            InlineKeyboardButton(f"📁 [{time_str}] 码:{code} ({count}个)", callback_data=f"view_{code}"),
-            InlineKeyboardButton("❌ 删除", callback_data=f"del_{code}")
-        ])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    if edit:
-        await message_obj.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    chat_id = update.effective_chat.id
+    if args:
+        file_list = db_get_resource(args[0])
+        if file_list:
+            await update.message.reply_text(f"🔍 正在下发共 {len(file_list)} 个文件...")
+            for i in range(0, len(file_list), 10):
+                chunk = file_list[i:i+10]
+                media = [InputMediaPhoto(media=x["file_id"]) if x["type"] == "photo" else InputMediaVideo(media=x["file_id"]) for x in chunk]
+                try:
+                    await context.bot.send_media_group(chat_id=chat_id, media=media)
+                except Exception as e:
+                    await update.message.reply_text(f"❌ 出错: {e}")
+        else:
+            await update.message.reply_text("❌ 未找到该存档。")
     else:
-        await message_obj.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        await update.message.reply_text("🔐 私人云盘就绪。直接发送图片或视频开始归档。")
 
-async def glwj_command(update: Update, context: ContextTypes.DEFAULT_TYPE
+def main():
+    token = os.environ.get("TOKEN")
+    if not token:
+        return
+    app = ApplicationBuilder().token(token).build()
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("glwj", glwj_command))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_incoming_media))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
