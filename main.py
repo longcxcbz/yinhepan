@@ -92,6 +92,23 @@ def run_web_server():
 
 threading.Thread(target=run_web_server, daemon=True).start()
 
+# 💡 新增：专门用来接收并恢复你发来的 .db 数据库文件
+async def handle_incoming_document(
+    update: Update, 
+    context: ContextTypes.DEFAULT_TYPE
+):
+    message = update.message
+    if not message or not message.document:
+        return
+    
+    document = message.document
+    if document.file_name and document.file_name.endswith(".db"):
+        file = await context.bot.get_file(document.file_id)
+        await file.download_to_drive(DB_FILE)
+        await message.reply_text("✅ **数据库恢复成功！**\n已成功加载您上传的数据库文件，所有历史存档已恢复在线。")
+    else:
+        await message.reply_text("📂 收到您的文件，但该文件不是 `.db` 数据库格式。")
+
 async def handle_incoming_media(
     update: Update, 
     context: ContextTypes.DEFAULT_TYPE
@@ -245,7 +262,6 @@ async def button_callback(
             raw_link = f"https://t.me/{BOT_USERNAME}?start={code}"
             await query.message.reply_text(f"📌 存档 `{code}`\n总数：{len(file_list)}个\n链接：\n`{raw_link}`", parse_mode="Markdown")
             
-    # 💡 处理分类选择查看的回调
     elif data.startswith("getall_"):
         code = data.split("_")[1]
         file_list = db_get_resource(code)
@@ -315,12 +331,10 @@ async def start_command(
         short_code = args[0]
         file_list = db_get_resource(short_code)
         if file_list:
-            # 💡 统计信息计算
             total_count = len(file_list)
             photo_count = sum(1 for x in file_list if x["type"] == "photo")
             video_count = sum(1 for x in file_list if x["type"] == "video")
             
-            # 计算总容量（MB）
             total_bytes = sum(x.get("size", 0) for x in file_list)
             if total_bytes > 1024 * 1024 * 1024:
                 size_str = f"{total_bytes / (1024 * 1024 * 1024):.2f} GB"
@@ -350,7 +364,7 @@ async def start_command(
         else:
             await update.message.reply_text("❌ 未找到该存档记录，可能已失效。")
     else:
-        await update.message.reply_text("🔐 私人云盘就绪。直接发送图片或视频开始归档。\n\n💡 发送 `/backup` 即可随时打包下载当前的数据库文件。")
+        await update.message.reply_text("🔐 私人云盘就绪。直接发送图片或视频开始归档。\n\n💡 发送 `/backup` 即可随时打包下载当前的数据库文件。\n💡 直接发送 `.db` 文件可恢复数据库。")
 
 def main():
     token = os.environ.get("TOKEN")
@@ -360,6 +374,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("glwj", glwj_command))
     app.add_handler(CommandHandler("backup", backup_command))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_incoming_document)) # 监听并恢复数据库文件
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_incoming_media))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.run_polling()
