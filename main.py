@@ -62,7 +62,11 @@ def db_get_all_resources():
     cursor.execute("SELECT short_code, file_list, created_at FROM resources ORDER BY created_at DESC")
     rows = cursor.fetchall()
     conn.close()
-    return [{"short_code": r[0], "count": len(json.loads(r[1])), "created_at": r[2]} for r in rows]
+    results = []
+    for r in rows:
+        flist = json.loads(r[1])
+        results.append({"short_code": r[0], "count": len(flist), "created_at": r[2]})
+    return results
 
 def db_delete_resource(short_code):
     conn = sqlite3.connect(DB_FILE)
@@ -101,19 +105,26 @@ async def handle_incoming_media(
     if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
         return
 
+    file_size = 0
     if message.photo:
         file_id = message.photo[-1].file_id
         file_type = "photo"
+        file_size = message.photo[-1].file_size or 0
     elif message.video:
         file_id = message.video.file_id
         file_type = "video"
+        file_size = message.video.file_size or 0
     else:
         return
 
     if chat_id not in UPLOADING_SESSIONS:
         UPLOADING_SESSIONS[chat_id] = {"files": [], "msg_id": None}
 
-    UPLOADING_SESSIONS[chat_id]["files"].append({"type": file_type, "file_id": file_id})
+    UPLOADING_SESSIONS[chat_id]["files"].append({
+        "type": file_type, 
+        "file_id": file_id,
+        "size": file_size
+    })
     total_count = len(UPLOADING_SESSIONS[chat_id]["files"])
 
     text = f"📥 **正在归档...**\n已暂存：**{total_count}** 个文件"
@@ -165,6 +176,21 @@ async def show_glwj_panel(
     else:
         await message_obj.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
+async def send_files_in_chunks(chat_id, context, file_list):
+    total = len(file_list)
+    await context.bot.send_message(chat_id=chat_id, text=f"🔍 正在为您下发文件，共 {total} 个，请稍候...")
+    for i in range(0, total, 10):
+        chunk = file_list[i:i+10]
+        media = [
+            InputMediaPhoto(media=x["file_id"]) if x["type"] == "photo" 
+            else InputMediaVideo(media=x["file_id"]) 
+            for x in chunk
+        ]
+        try:
+            await context.bot.send_media_group(chat_id=chat_id, media=media)
+        except Exception as e:
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ 下发出错: {e}")
+
 async def button_callback(
     update: Update, 
     context: ContextTypes.DEFAULT_TYPE
@@ -179,7 +205,7 @@ async def button_callback(
         session_files = session_data["files"]
 
         if not session_files:
-            await query.message.edit_text("✅ 该组文件已经成功打包过了，请直接使用上方生成的链接，或重新发送新文件进行归档。")
+            await query.message.edit_text("✅ 该组文件已经成功打包过了。")
             return
 
         short_code = session_files[0]["file_id"][-8:]
@@ -189,7 +215,6 @@ async def button_callback(
         raw_link = f"https://t.me/{BOT_USERNAME}?start={short_code}"
         text = (
             f"🎉 **归档成功！**\n"
-            f"📁 文件数：{len(session_files)}\n"
             f"🔑 识别码：`{short_code}`\n\n"
             f"🔗 **提取链接**（点击下方代码即可复制）：\n"
             f"`{raw_link}`"
@@ -218,7 +243,38 @@ async def button_callback(
         file_list = db_get_resource(code)
         if file_list:
             raw_link = f"https://t.me/{BOT_USERNAME}?start={code}"
-            await query.message.reply_text(f"📌 存档 `{code}`\n数量：{len(file_list)}个\n链接：\n`{raw_link}`", parse_mode="Markdown")
+            await query.message.reply_text(f"📌 存档 `{code}`\n总数：{len(file_list)}个\n链接：\n`{raw_link}`", parse_mode="Markdown")
+            
+    # 💡 处理分类选择查看的回调
+    elif data.startswith("getall_"):
+        code = data.split("_")[1]
+        file_list = db_get_resource(code)
+        if file_list:
+            await send_files_in_chunks(chat_id, context, file_list)
+        else:
+            await query.message.reply_text("❌ 存档已失效。")
+    elif data.startswith("getphoto_"):
+        code = data.split("_")[1]
+        file_list = db_get_resource(code)
+        if file_list:
+            photos = [x for x in file_list if x["type"] == "photo"]
+            if photos:
+                await send_files_in_chunks(chat_id, context, photos)
+            else:
+                await query.message.reply_text("📂 该存档中没有图片。")
+        else:
+            await query.message.reply_text("❌ 存档已失效。")
+    elif data.startswith("getvideo_"):
+        code = data.split("_")[1]
+        file_list = db_get_resource(code)
+        if file_list:
+            videos = [x for x in file_list if x["type"] == "video"]
+            if videos:
+                await send_files_in_chunks(chat_id, context, videos)
+            else:
+                await query.message.reply_text("📂 该存档中没有视频。")
+        else:
+            await query.message.reply_text("❌ 存档已失效。")
 
 async def glwj_command(
     update: Update, 
@@ -228,7 +284,6 @@ async def glwj_command(
         return
     await show_glwj_panel(update.message, edit=False)
 
-# 💡 新增：手动获取数据库备份文件的命令
 async def backup_command(
     update: Update, 
     context: ContextTypes.DEFAULT_TYPE
@@ -243,7 +298,7 @@ async def backup_command(
                 await context.bot.send_document(
                     chat_id=chat_id, 
                     document=f, 
-                    caption="📦 【手动备份】这是您当前的数据库文件（private_database.db）。"
+                    caption="📦 【手动备份】这是您当前的数据库文件。"
                 )
         except Exception as e:
             await update.message.reply_text(f"❌ 发送备份文件失败: {e}")
@@ -257,22 +312,43 @@ async def start_command(
     args = context.args
     chat_id = update.effective_chat.id
     if args:
-        file_list = db_get_resource(args[0])
+        short_code = args[0]
+        file_list = db_get_resource(short_code)
         if file_list:
-            await update.message.reply_text(f"🔍 正在下发共 {len(file_list)} 个文件...")
-            for i in range(0, len(file_list), 10):
-                chunk = file_list[i:i+10]
-                media = [
-                    InputMediaPhoto(media=x["file_id"]) if x["type"] == "photo" 
-                    else InputMediaVideo(media=x["file_id"]) 
-                    for x in chunk
+            # 💡 统计信息计算
+            total_count = len(file_list)
+            photo_count = sum(1 for x in file_list if x["type"] == "photo")
+            video_count = sum(1 for x in file_list if x["type"] == "video")
+            
+            # 计算总容量（MB）
+            total_bytes = sum(x.get("size", 0) for x in file_list)
+            if total_bytes > 1024 * 1024 * 1024:
+                size_str = f"{total_bytes / (1024 * 1024 * 1024):.2f} GB"
+            else:
+                size_str = f"{total_bytes / (1024 * 1024):.2f} MB"
+
+            overview_text = (
+                f"📊 **私密存档概览**\n\n"
+                f"🔑 识别码：`{short_code}`\n"
+                f"🖼️ 图片数量：**{photo_count}** 个\n"
+                f"🎬 视频数量：**{video_count}** 个\n"
+                f"📦 总文件数：**{total_count}** 个\n"
+                f"💾 估计总容量：**{size_str}**\n\n"
+                f"👇 **请选择您要查看的内容：**"
+            )
+
+            keyboard = [
+                [InlineKeyboardButton(f"👀 查看全部 ({total_count}个)", callback_data=f"getall_{short_code}")],
+                [
+                    InlineKeyboardButton(f"🖼️ 仅看图片 ({photo_count}个)", callback_data=f"getphoto_{short_code}"),
+                    InlineKeyboardButton(f"🎬 仅看视频 ({video_count}个)", callback_data=f"getvideo_{short_code}")
                 ]
-                try:
-                    await context.bot.send_media_group(chat_id=chat_id, media=media)
-                except Exception as e:
-                    await update.message.reply_text(f"❌ 出错: {e}")
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await update.message.reply_text(overview_text, reply_markup=reply_markup, parse_mode="Markdown")
         else:
-            await update.message.reply_text("❌ 未找到该存档。")
+            await update.message.reply_text("❌ 未找到该存档记录，可能已失效。")
     else:
         await update.message.reply_text("🔐 私人云盘就绪。直接发送图片或视频开始归档。\n\n💡 发送 `/backup` 即可随时打包下载当前的数据库文件。")
 
@@ -283,7 +359,7 @@ def main():
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("glwj", glwj_command))
-    app.add_handler(CommandHandler("backup", backup_command)) # 注册备份命令
+    app.add_handler(CommandHandler("backup", backup_command))
     app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_incoming_media))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.run_polling()
