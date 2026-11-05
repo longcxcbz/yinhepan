@@ -152,7 +152,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session_files = session_data["files"]
 
         if not session_files:
-            await query.message.reply_text("❌ 暂存文件已被刷新，请重新发送！")
+            await query.message.edit_text("✅ 该组文件已经成功打包过了，请直接使用上方生成的链接，或重新发送新文件进行归档。")
             return
 
         short_code = session_files[0]["file_id"][-8:]
@@ -167,6 +167,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("📋 点击复制链接", copy_text=raw_link)],
             [InlineKeyboardButton("🛠️ 进入管理后台", callback_data="goto_glwj")]
         ]
+        
+        try:
+            await query.message.edit_text("✅ **本组文件已打包入库完成！**", reply_markup=None)
+        except Exception:
+            pass
+
         await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
         try:
@@ -189,40 +195,4 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raw_link = f"https://t.me/{BOT_USERNAME}?start={code}"
             await query.message.reply_text(f"📌 存档 `{code}`\n数量：{len(file_list)}个\n链接：\n`{raw_link}`", parse_mode="Markdown")
 
-async def glwj_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if ADMIN_USER_ID != 0 and update.effective_user.id != ADMIN_USER_ID:
-        return
-    await show_glwj_panel(update.message, edit=False)
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    chat_id = update.effective_chat.id
-    if args:
-        file_list = db_get_resource(args[0])
-        if file_list:
-            await update.message.reply_text(f"🔍 正在下发共 {len(file_list)} 个文件...")
-            for i in range(0, len(file_list), 10):
-                chunk = file_list[i:i+10]
-                media = [InputMediaPhoto(media=x["file_id"]) if x["type"] == "photo" else InputMediaVideo(media=x["file_id"]) for x in chunk]
-                try:
-                    await context.bot.send_media_group(chat_id=chat_id, media=media)
-                except Exception as e:
-                    await update.message.reply_text(f"❌ 出错: {e}")
-        else:
-            await update.message.reply_text("❌ 未找到该存档。")
-    else:
-        await update.message.reply_text("🔐 私人云盘就绪。直接发送图片或视频开始归档。")
-
-def main():
-    token = os.environ.get("TOKEN")
-    if not token:
-        return
-    app = ApplicationBuilder().token(token).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("glwj", glwj_command))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_incoming_media))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
+async def glwj_command(update: Update, context: ContextTypes
