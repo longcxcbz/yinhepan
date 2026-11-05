@@ -26,7 +26,6 @@ logging.basicConfig(
 BOT_USERNAME = "Yinhepan_bot"  # 你的自用机器人用户名
 
 # 💡 【重要安全设置】：为了防止别人误用你的机器人，请在这里填入你自己的 Telegram 数字 ID
-# (如果不填或填 0，则默认允许第一个跟机器人说话的人，建议填你的真实 ID)
 ADMIN_USER_ID = 0  # 例如: 123456789 (你可以先运行一次，看后台日志打印的 User ID 填进来)
 # ==========================================
 
@@ -121,10 +120,8 @@ async def handle_incoming_media(update: Update, context: ContextTypes.DEFAULT_TY
     chat_id = message.chat_id
     user_id = message.from_user.id
 
-    # 打印你的 User ID 方便你在代码里绑定 ADMIN_USER_ID
     logging.info(f"收到来自用户 ID: {user_id} 的消息")
 
-    # 如果设置了管理员白名单，非主人发的文件直接忽略
     if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
         await message.reply_text("⛔ 这是一个私人专属机器人，您没有权限使用。")
         return
@@ -193,12 +190,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎉 **私密归档成功！**\n\n"
             f"📁 包含文件总数：{len(session_files)} 个\n"
             f"🔑 存档识别码：`{short_code}`\n\n"
-            f"🔗 **提取链接**：\n`{raw_link}`\n\n"
+            f"🔗 **提取链接**：\n"
+            f"[点击直达提取文件]({raw_link})\n\n"
             f"💡 发送 `/glwj` 可以随时进入后台复查和管理历史存档。"
         )
         
+        # 💡 包含一键提取、一键复制链接、后台管理按钮
         keyboard = [
             [InlineKeyboardButton("🔗 一键提取查看", url=raw_link)],
+            [InlineKeyboardButton("📋 点击复制链接", copy_text=raw_link)],
             [InlineKeyboardButton("🛠️ 进入管理/复查后台", callback_data="goto_glwj")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -206,7 +206,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
     elif data == "goto_glwj":
-        # 快捷触发后台列表
         await show_glwj_panel(query.message, edit=True)
 
     elif data.startswith("del_"):
@@ -222,103 +221,4 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raw_link = f"https://t.me/{BOT_USERNAME}?start={short_code}"
             await query.message.reply_text(
                 f"📌 **存档复查详情**\n\n"
-                f"• 识别码：`{short_code}`\n"
-                f"• 文件数量：{count} 个\n"
-                f"• 提取链接：\n`{raw_link}`",
-                parse_mode="Markdown"
-            )
-        else:
-            await query.message.reply_text("❌ 未找到该存档记录，可能已被删除。")
-
-# ==========================================
-# 4. 私人复查后台：/glwj 命令
-# ==========================================
-async def show_glwj_panel(message_obj, edit=False):
-    resources = db_get_all_resources()
-
-    if not resources:
-        text = "📂 目前私密云盘中还没有任何存档记录。"
-        if edit:
-            await message_obj.edit_text(text)
-        else:
-            await message_obj.reply_text(text)
-        return
-
-    text = f"🛠️ **私人云盘存档复查后台**\n共找到 {len(resources)} 组历史存档：\n\n"
-    keyboard = []
-
-    for item in resources:
-        code = item["short_code"]
-        count = item["count"]
-        time_str = item["created_at"][:16] # 显示到分钟
-        keyboard.append([
-            InlineKeyboardButton(f"📁 [{time_str}] 码:{code} ({count}个)", callback_data=f"view_{code}"),
-            InlineKeyboardButton("❌ 删除", callback_data=f"del_{code}")
-        ])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    if edit:
-        await message_obj.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
-    else:
-        await message_obj.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
-
-async def glwj_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
-        return
-    await show_glwj_panel(update.message, edit=False)
-
-# ==========================================
-# 5. 提取存档（/start 触发）
-# ==========================================
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    chat_id = update.effective_chat.id
-
-    if args:
-        short_code = args[0]
-        file_list = db_get_resource(short_code)
-
-        if file_list:
-            total = len(file_list)
-            await update.message.reply_text(f"🔍 正在为您调阅存档（共 {total} 个文件），正在下发中...")
-
-            for i in range(0, total, 10):
-                chunk = file_list[i:i+10]
-                media_group = []
-                for item in chunk:
-                    if item["type"] == "photo":
-                        media_group.append(InputMediaPhoto(media=item["file_id"]))
-                    elif item["type"] == "video":
-                        media_group.append(InputMediaVideo(media=item["file_id"]))
-
-                try:
-                    await context.bot.send_media_group(chat_id=chat_id, media=media_group)
-                except Exception as e:
-                    await update.message.reply_text(f"❌ 调阅文件出错: {e}")
-        else:
-            await update.message.reply_text("❌ 未找到该存档记录，可能已失效或被清理。")
-    else:
-        await update.message.reply_text("🔐 欢迎使用您的私人云盘复查机器人。直接发送图片或视频开始归档。")
-
-# ==========================================
-# 6. 主程序入口
-# ==========================================
-def main():
-    token = os.environ.get("TOKEN")
-    if not token:
-        print("错误: 未找到 TOKEN 环境变量！")
-        return
-
-    application = ApplicationBuilder().token(token).build()
-
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("glwj", glwj_command))
-    application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_incoming_media))
-    application.add_handler(CallbackQueryHandler(button_callback))
-
-    print("私人云盘复查机器人正在运行...")
-    application.run_polling()
-
-if __name__ == "__main__":
-    main()
+                f"• 识别码：
