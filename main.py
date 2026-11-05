@@ -4,7 +4,13 @@ import sqlite3
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, Update
+from telegram import (
+    InlineKeyboardButton, 
+    InlineKeyboardMarkup, 
+    InputMediaPhoto, 
+    InputMediaVideo, 
+    Update
+)
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -82,7 +88,10 @@ def run_web_server():
 
 threading.Thread(target=run_web_server, daemon=True).start()
 
-async def handle_incoming_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_incoming_media(
+    update: Update, 
+    context: ContextTypes.DEFAULT_TYPE
+):
     message = update.message
     if not message:
         return
@@ -117,12 +126,21 @@ async def handle_incoming_media(update: Update, context: ContextTypes.DEFAULT_TY
             sent_msg = await message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
             UPLOADING_SESSIONS[chat_id]["msg_id"] = sent_msg.message_id
         else:
-            await context.bot.edit_message_text(chat_id=chat_id, message_id=current_msg_id, text=text, reply_markup=reply_markup, parse_mode="Markdown")
+            await context.bot.edit_message_text(
+                chat_id=chat_id, 
+                message_id=current_msg_id, 
+                text=text, 
+                reply_markup=reply_markup, 
+                parse_mode="Markdown"
+            )
     except Exception:
         sent_msg = await message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
         UPLOADING_SESSIONS[chat_id]["msg_id"] = sent_msg.message_id
 
-async def show_glwj_panel(message_obj, edit=False):
+async def show_glwj_panel(
+    message_obj, 
+    edit=False
+):
     resources = db_get_all_resources()
     if not resources:
         text = "📂 目前没有任何存档记录。"
@@ -133,7 +151,13 @@ async def show_glwj_panel(message_obj, edit=False):
         return
 
     text = f"🛠️ **存档复查后台**\n共找到 {len(resources)} 组存档："
-    keyboard = [[InlineKeyboardButton(f"📁 码:{i['short_code']} ({i['count']}个)", callback_data=f"view_{i['short_code']}"), InlineKeyboardButton("❌ 删除", callback_data=f"del_{i['short_code']}")] for i in resources]
+    keyboard = [
+        [
+            InlineKeyboardButton(f"📁 码:{i['short_code']} ({i['count']}个)", callback_data=f"view_{i['short_code']}"), 
+            InlineKeyboardButton("❌ 删除", callback_data=f"del_{i['short_code']}")
+        ] 
+        for i in resources
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     if edit:
@@ -141,7 +165,10 @@ async def show_glwj_panel(message_obj, edit=False):
     else:
         await message_obj.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_callback(
+    update: Update, 
+    context: ContextTypes.DEFAULT_TYPE
+):
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat_id
@@ -195,4 +222,50 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raw_link = f"https://t.me/{BOT_USERNAME}?start={code}"
             await query.message.reply_text(f"📌 存档 `{code}`\n数量：{len(file_list)}个\n链接：\n`{raw_link}`", parse_mode="Markdown")
 
-async def glwj_command(update: Update, context: ContextTypes
+async def glwj_command(
+    update: Update, 
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if ADMIN_USER_ID != 0 and update.effective_user.id != ADMIN_USER_ID:
+        return
+    await show_glwj_panel(update.message, edit=False)
+
+async def start_command(
+    update: Update, 
+    context: ContextTypes.DEFAULT_TYPE
+):
+    args = context.args
+    chat_id = update.effective_chat.id
+    if args:
+        file_list = db_get_resource(args[0])
+        if file_list:
+            await update.message.reply_text(f"🔍 正在下发共 {len(file_list)} 个文件...")
+            for i in range(0, len(file_list), 10):
+                chunk = file_list[i:i+10]
+                media = [
+                    InputMediaPhoto(media=x["file_id"]) if x["type"] == "photo" 
+                    else InputMediaVideo(media=x["file_id"]) 
+                    for x in chunk
+                ]
+                try:
+                    await context.bot.send_media_group(chat_id=chat_id, media=media)
+                except Exception as e:
+                    await update.message.reply_text(f"❌ 出错: {e}")
+        else:
+            await update.message.reply_text("❌ 未找到该存档。")
+    else:
+        await update.message.reply_text("🔐 私人云盘就绪。直接发送图片或视频开始归档。")
+
+def main():
+    token = os.environ.get("TOKEN")
+    if not token:
+        return
+    app = ApplicationBuilder().token(token).build()
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("glwj", glwj_command))
+    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_incoming_media))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
