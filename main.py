@@ -1,6 +1,8 @@
 import logging
 import math
 import os
+import random
+import re
 import secrets
 import sqlite3
 import json
@@ -34,10 +36,7 @@ MAX_VISIBLE_PAGES = 5   # 首批平铺显示的页码数量，超出折叠为 "6
 
 DEFAULT_AD_CONFIG = {
     "enabled": False,
-    "photo_id": "",
-    "caption": "",
-    "btn_text": "",
-    "btn_url": ""
+    "ads": []
 }
 
 # 记录每个用户对 (short_code, mode) 已获取过的页码集合：{(chat_id, short_code, mode): {1, 2}}
@@ -68,7 +67,6 @@ def db_code_exists(short_code):
     return exists
 
 def generate_unique_short_code(length=8):
-    # 循环生成随机码并查库判重，确保绝对不重复、不覆盖已有存档
     while True:
         code = secrets.token_hex((length + 1) // 2)[:length]
         if not db_code_exists(code):
@@ -108,7 +106,59 @@ def db_delete_resource(short_code):
     conn.commit()
     conn.close()
 
-# --- 2. ad_config.json 广告文件读写 ---
+# --- 2. ad_config.json 多广告池读写 ---
+def clean_ad_url(raw_url):
+    if not raw_url:
+        return ""
+    md_match = re.search(r"\((https?://[^\s\)]+)\)", raw_url)
+    if md_match:
+        url = md_match.group(1)
+    else:
+        url = re.sub(r"[\[\]\(\)<>\"']", "", raw_url).strip()
+    url = url.strip(".,;!?")
+    if url and not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url
+
+def normalize_ad_item(item):
+    if not isinstance(item, dict):
+        return None
+    media_type = item.get("media_type") or ("photo" if item.get("photo_id") else ("video" if item.get("video_id") else "text"))
+    photo_id = item.get("photo_id") or ""
+    video_id = item.get("video_id") or ""
+    caption = item.get("caption") or ""
+
+    raw_buttons = item.get("buttons")
+    buttons = []
+    if isinstance(raw_buttons, list):
+        for b in raw_buttons:
+            if isinstance(b, dict):
+                b_text = (b.get("text") or "").strip()
+                b_url = clean_ad_url(b.get("url") or "")
+                if b_text and b_url:
+                    buttons.append({"text": b_text, "url": b_url})
+    else:
+        # 兼容旧单按钮格式 btn_text / btn_url
+        b_text = (item.get("btn_text") or "").strip()
+        b_url = clean_ad_url(item.get("btn_url") or "")
+        if b_text and b_url:
+            buttons.append({"text": b_text, "url": b_url})
+
+    if media_type == "photo" and not photo_id and not caption and not buttons:
+        return None
+    if media_type == "video" and not video_id and not caption and not buttons:
+        return None
+    if media_type == "text" and not caption and not buttons:
+        return None
+
+    return {
+        "media_type": media_type,
+        "photo_id": photo_id,
+        "video_id": video_id,
+        "caption": caption,
+        "buttons": buttons
+    }
+
 def load_ad_config():
     if not os.path.exists(AD_CONFIG_FILE):
         save_ad_config(DEFAULT_AD_CONFIG)
@@ -116,52 +166,68 @@ def load_ad_config():
     try:
         with open(AD_CONFIG_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        merged = dict(DEFAULT_AD_CONFIG)
-        if isinstance(data, dict):
-            merged.update(data)
-        return merged
+        if not isinstance(data, dict):
+            return dict(DEFAULT_AD_CONFIG)
+
+        enabled = bool(data.get("enabled", False))
+        ads = []
+        if isinstance(data.get("ads"), list):
+            for entry in data["ads"]:
+                norm = normalize_ad_item(entry)
+                if norm:
+                    ads.append(norm)
+        else:
+            # 兼容旧单条广告配置结构
+            single = normalize_ad_item(data)
+            if single:
+                ads.append(single)
+
+        return {"enabled": enabled, "ads": ads}
     except Exception as e:
         logging.error(f"读取 {AD_CONFIG_FILE} 失败: {e}")
         return dict(DEFAULT_AD_CONFIG)
 
 def save_ad_config(config_dict):
-    merged = dict(DEFAULT_AD_CONFIG)
-    merged.update(config_dict)
+    enabled = bool(config_dict.get("enabled", False))
+    ads = []
+    if isinstance(config_dict.get("ads"), list):
+        for entry in config_dict["ads"]:
+            norm = normalize_ad_item(entry)
+            if norm:
+                ads.append(norm)
+    payload = {"enabled": enabled, "ads": ads}
     with open(AD_CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(merged, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
 load_ad_config()
 
-def db_save_ad(photo_id, caption, btn_text, btn_url):
-    save_ad_config({
-        "enabled": True,
+def add_ad_to_config(media_type="text", photo_id="", video_id="", caption="", buttons=None):
+    cfg = load_ad_config()
+    new_ad = normalize_ad_item({
+        "media_type": media_type or "text",
         "photo_id": photo_id or "",
+        "video_id": video_id or "",
         "caption": caption or "",
-        "btn_text": btn_text or "",
-        "btn_url": btn_url or ""
+        "buttons": buttons or []
     })
+    if not new_ad:
+        return None
+    ads = cfg.get("ads", [])
+    ads.append(new_ad)
+    save_ad_config({"enabled": True, "ads": ads})
+    return new_ad
 
-def db_get_ad():
+def pick_random_ad():
     cfg = load_ad_config()
     if not cfg.get("enabled"):
         return None
-    if not cfg.get("photo_id") and not cfg.get("caption"):
+    ads = cfg.get("ads") or []
+    if not ads:
         return None
-    return {
-        "photo_id": cfg.get("photo_id") or None,
-        "caption": cfg.get("caption") or "",
-        "btn_text": cfg.get("btn_text") or "",
-        "btn_url": cfg.get("btn_url") or ""
-    }
+    return random.choice(ads)
 
 def db_delete_ad():
-    save_ad_config({
-        "enabled": False,
-        "photo_id": "",
-        "caption": "",
-        "btn_text": "",
-        "btn_url": ""
-    })
+    save_ad_config(DEFAULT_AD_CONFIG)
 
 UPLOADING_SESSIONS = {}
 WAITING_AD_USERS = set()
@@ -348,59 +414,99 @@ def build_overview_payload(short_code, file_list):
     ]
     return overview_text, InlineKeyboardMarkup(keyboard)
 
-# --- 4. 广告展示与解析 ---
-async def send_ad_to_user(chat_id, context, is_preview=False):
-    ad = db_get_ad()
+# --- 4. 多广告随机展示与多按钮解析 ---
+def build_ad_keyboard(buttons):
+    if not buttons:
+        return None
+    rows = []
+    # 每行最多 2 个按钮，超出自动换行
+    for i in range(0, len(buttons), 2):
+        row = [
+            InlineKeyboardButton(btn["text"], url=btn["url"])
+            for btn in buttons[i:i + 2]
+        ]
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+async def send_specific_ad(chat_id, context, ad, is_preview=False):
     if not ad:
         if is_preview:
-            await context.bot.send_message(chat_id=chat_id, text="⚠️ 广告内容为空或未启用，无法预览。")
+            await context.bot.send_message(chat_id=chat_id, text="⚠️ 当前没有可用的广告配置。")
         return
-    
-    reply_markup = None
-    if ad["btn_text"] and ad["btn_url"]:
-        url = ad["btn_url"].strip()
-        if not url.startswith(("http://", "https://")):
-            url = "https://" + url
-        reply_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton(ad["btn_text"], url=url)]
-        ])
-    
+
+    reply_markup = build_ad_keyboard(ad.get("buttons") or [])
     try:
-        if ad["photo_id"]:
+        mtype = ad["media_type"]
+        if mtype == "video" and ad.get("video_id"):
+            await context.bot.send_video(
+                chat_id=chat_id,
+                video=ad["video_id"],
+                caption=ad.get("caption") or None,
+                reply_markup=reply_markup
+            )
+        elif mtype == "photo" and ad.get("photo_id"):
             await context.bot.send_photo(
                 chat_id=chat_id,
                 photo=ad["photo_id"],
-                caption=ad["caption"] or None,
+                caption=ad.get("caption") or None,
                 reply_markup=reply_markup
             )
-        elif ad["caption"]:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=ad["caption"],
-                reply_markup=reply_markup,
-                disable_web_page_preview=False
-            )
+        else:
+            text_to_send = ad.get("caption") or (ad["buttons"][0]["url"] if ad.get("buttons") else "")
+            if text_to_send:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=text_to_send,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=False
+                )
     except Exception as e:
         logging.error(f"发送广告失败: {e}")
         if is_preview:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"❌ **广告预览发送失败**\n原因：`{e}`\n请检查按钮链接是否为有效网址或文案是否过长。",
+                text=f"❌ **广告预览发送失败**\n原因：`{e}`\n请检查各按钮链接是否为有效网址。",
                 parse_mode="Markdown"
             )
 
+async def send_ad_to_user(chat_id, context, is_preview=False):
+    ad = pick_random_ad()
+    await send_specific_ad(chat_id, context, ad, is_preview=is_preview)
+
+def _extract_buttons_from_line(line):
+    # 支持同一行用 ； 或 ; 分隔多个 按钮名|链接，也支持单个 按钮名|链接
+    parts = [p.strip() for p in re.split(r"[；;]", line) if p.strip()]
+    parsed = []
+    for part in parts:
+        if "|" in part and ("http://" in part or "https://" in part or "t.me/" in part):
+            b_text, b_url = part.split("|", 1)
+            b_text = b_text.strip()
+            b_url = clean_ad_url(b_url.strip())
+            if b_text and b_url:
+                parsed.append({"text": b_text, "url": b_url})
+    return parsed
+
 def parse_ad_text(raw_text):
     if not raw_text:
-        return "", "", ""
-    lines = raw_text.strip().split("\n")
-    last_line = lines[-1].strip()
-    if "|" in last_line and ("http://" in last_line or "https://" in last_line):
-        parts = last_line.split("|", 1)
-        btn_text = parts[0].strip()
-        btn_url = parts[1].strip()
-        caption = "\n".join(lines[:-1]).strip()
-        return caption, btn_text, btn_url
-    return raw_text.strip(), "", ""
+        return "", []
+    lines = [line.rstrip() for line in raw_text.strip().split("\n") if line.strip()]
+    if not lines:
+        return "", []
+
+    # 从末尾向上收集连续的按钮定义行
+    collected_buttons = []
+    split_idx = len(lines)
+    for idx in range(len(lines) - 1, -1, -1):
+        line_btns = _extract_buttons_from_line(lines[idx])
+        if line_btns:
+            collected_buttons.extend(reversed(line_btns))
+            split_idx = idx
+        else:
+            break
+
+    collected_buttons.reverse()
+    caption = "\n".join(lines[:split_idx]).strip()
+    return caption, collected_buttons
 
 async def setad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -408,17 +514,15 @@ async def setad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     WAITING_AD_USERS.add(user_id)
     guide_text = (
-        "📢 **进入广告设置模式**\n\n"
-        "请直接发送一条**【带文字的图片】**（或纯文字消息），格式如下：\n\n"
+        "📢 **进入广告添加模式（支持多广告随机 + 多按钮）**\n\n"
+        "请发送**纯文本**、**带说明的图片**或**带说明的视频**，末尾可写一个或多个按钮（支持多行或用 `；` 分隔）：\n\n"
         "```\n"
-        "这里写你的广告推广文案...\n"
-        "支持多行换行。\n"
-        "点击加入频道|[https://t.me/你的频道](https://t.me/你的频道)\n"
+        "精选资源每日更新，欢迎加入！\n"
+        "主频道|[https://t.me/jisogd](https://t.me/jisogd)；备用群|[https://t.me/your_group](https://t.me/your_group)\n"
         "```\n"
         "💡 **说明**：\n"
-        "• 设置后会自动写入 `ad_config.json` 独立配置文件。\n"
-        "• 最后一行用 `按钮名称|链接` 格式会自动生成底部跳转按钮。\n"
-        "• 发送 `/cancelad` 可取消本次设置。"
+        "• 每次设置会添加到 `ad_config.json` 广告池，用户提取文件时随机展示其中一条。\n"
+        "• 发送 `/cancelad` 取消本次设置；发送 `/delad` 清空全部广告。"
     )
     await update.message.reply_text(guide_text, parse_mode="Markdown")
 
@@ -433,7 +537,7 @@ async def delad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
         return
     db_delete_ad()
-    await update.message.reply_text("🗑️ 当前广告已关闭并清空 `ad_config.json`。")
+    await update.message.reply_text("🗑️ 已清空 `ad_config.json` 中的全部广告。")
 
 async def handle_incoming_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -442,10 +546,11 @@ async def handle_incoming_text(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = message.from_user.id
     if user_id in WAITING_AD_USERS:
         WAITING_AD_USERS.remove(user_id)
-        caption, btn_text, btn_url = parse_ad_text(message.text)
-        db_save_ad(None, caption, btn_text, btn_url)
-        await message.reply_text("✅ **纯文字广告已保存至 `ad_config.json`！** 效果预览如下：")
-        await send_ad_to_user(message.chat_id, context, is_preview=True)
+        caption, buttons = parse_ad_text(message.text)
+        saved_ad = add_ad_to_config(media_type="text", caption=caption, buttons=buttons)
+        total_ads = len(load_ad_config().get("ads", []))
+        await message.reply_text(f"✅ **纯文本广告已加入广告池（当前共 {total_ads} 条，随机展示）！** 预览如下：")
+        await send_specific_ad(message.chat_id, context, saved_ad, is_preview=True)
 
 async def handle_incoming_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -460,7 +565,8 @@ async def handle_incoming_document(update: Update, context: ContextTypes.DEFAULT
     elif document.file_name == AD_CONFIG_FILE:
         file = await context.bot.get_file(document.file_id)
         await file.download_to_drive(AD_CONFIG_FILE)
-        await message.reply_text("✅ **广告配置文件 `ad_config.json` 已加载生效！** 效果预览如下：")
+        cfg = load_ad_config()
+        await message.reply_text(f"✅ **广告配置文件 `ad_config.json` 已加载生效（共 {len(cfg.get('ads', []))} 条广告）！** 随机预览如下：")
         await send_ad_to_user(message.chat_id, context, is_preview=True)
     else:
         await message.reply_text("📂 收到您的文件，但该文件不是 `.db` 数据库或 `ad_config.json` 配置文件。")
@@ -475,13 +581,20 @@ async def handle_incoming_media(update: Update, context: ContextTypes.DEFAULT_TY
     if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
         return
 
-    if user_id in WAITING_AD_USERS and message.photo:
+    if user_id in WAITING_AD_USERS and (message.photo or message.video):
         WAITING_AD_USERS.remove(user_id)
-        photo_id = message.photo[-1].file_id
-        caption, btn_text, btn_url = parse_ad_text(message.caption or "")
-        db_save_ad(photo_id, caption, btn_text, btn_url)
-        await message.reply_text("✅ **图文广告已保存至 `ad_config.json`！** 效果预览如下：")
-        await send_ad_to_user(chat_id, context, is_preview=True)
+        caption, buttons = parse_ad_text(message.caption or "")
+        if message.video:
+            video_id = message.video.file_id
+            saved_ad = add_ad_to_config(media_type="video", video_id=video_id, caption=caption, buttons=buttons)
+            label = "视频广告"
+        else:
+            photo_id = message.photo[-1].file_id
+            saved_ad = add_ad_to_config(media_type="photo", photo_id=photo_id, caption=caption, buttons=buttons)
+            label = "图文广告"
+        total_ads = len(load_ad_config().get("ads", []))
+        await message.reply_text(f"✅ **{label}已加入广告池（当前共 {total_ads} 条，随机展示）！** 预览如下：")
+        await send_specific_ad(chat_id, context, saved_ad, is_preview=True)
         return
 
     file_size = 0
@@ -673,7 +786,7 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_document(
                     chat_id=chat_id,
                     document=f,
-                    caption="📢 【广告配置】这是您当前的 ad_config.json 广告文件。"
+                    caption="📢 【广告配置】这是您当前的 ad_config.json 多广告配置文件。"
                 )
         except Exception as e:
             await update.message.reply_text(f"❌ 发送广告配置文件失败: {e}")
@@ -694,8 +807,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🔐 私人云盘就绪。直接发送图片或视频开始归档。\n\n"
             "• `/glwj` - 管理已有存档\n"
-            "• `/setad` - 设置提取时展示的图文广告（同步写入 ad_config.json）\n"
-            "• `/delad` - 关闭并清空广告\n"
+            "• `/setad` - 添加广告到广告池（支持文本/图片/视频 + 多按钮，随机展示）\n"
+            "• `/delad` - 清空全部广告\n"
             "• `/backup` - 打包下载数据库与 ad_config.json"
         )
 
