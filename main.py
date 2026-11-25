@@ -27,7 +27,18 @@ from telegram.ext import (
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
 BOT_USERNAME = "Yinhepan_bot"
-ADMIN_USER_ID = 8790114086
+
+# 填写允许上传归档及执行管理命令的 Telegram 数字 ID（可填多个，用逗号分隔；留空 set() 则不限制）
+ADMIN_USER_IDS = {
+    8790114086,
+    987654321,
+}
+
+def is_admin(user_id: int) -> bool:
+    if not ADMIN_USER_IDS:
+        return True
+    return user_id in ADMIN_USER_IDS
+
 DB_FILE = "private_database.db"
 AD_CONFIG_FILE = "ad_config.json"
 
@@ -560,15 +571,14 @@ def build_ad_list_payload():
     return "\n".join(lines), InlineKeyboardMarkup(keyboard)
 
 async def listad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
+    if not is_admin(update.effective_user.id):
         return
     text, markup = build_ad_list_payload()
     await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
 
 async def editad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
+    if not is_admin(user_id):
         return
     ads = get_ads_list()
     if not context.args or not context.args[0].isdigit():
@@ -588,7 +598,7 @@ async def editad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
+    if not is_admin(user_id):
         return
     EDITING_AD_INDEX.pop(user_id, None)
     WAITING_AD_USERS.add(user_id)
@@ -615,8 +625,7 @@ async def cancelad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❎ 已退出广告设置/修改模式。")
 
 async def delad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
+    if not is_admin(update.effective_user.id):
         return
     ads = get_ads_list()
     if context.args:
@@ -684,7 +693,7 @@ async def handle_incoming_media(update: Update, context: ContextTypes.DEFAULT_TY
     chat_id = message.chat_id
     user_id = message.from_user.id
 
-    if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
+    if not is_admin(user_id):
         return
 
     if user_id in EDITING_AD_INDEX and (message.photo or message.video):
@@ -795,7 +804,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data.startswith("adprev|"):
-        if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
+        if not is_admin(user_id):
             return
         seq = int(data.split("|")[1])
         ads = get_ads_list()
@@ -807,7 +816,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("addel|"):
-        if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
+        if not is_admin(user_id):
             return
         seq = int(data.split("|")[1])
         if delete_ad_at_index(seq - 1):
@@ -907,13 +916,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.edit_text(overview_text, reply_markup=markup, parse_mode="Markdown")
 
 async def glwj_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if ADMIN_USER_ID != 0 and update.effective_user.id != ADMIN_USER_ID:
+    if not is_admin(update.effective_user.id):
         return
     await show_glwj_panel(update.message, edit=False)
 
 async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    if ADMIN_USER_ID != 0 and update.effective_user.id != ADMIN_USER_ID:
+    if not is_admin(update.effective_user.id):
         return
     
     if os.path.exists(DB_FILE):
