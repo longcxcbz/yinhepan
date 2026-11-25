@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import math
@@ -27,23 +28,33 @@ from telegram.ext import (
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-BOT_USERNAME = "Yinhepan_bot"
+# --- 两个机器人基础配置 ---
+PAN_BOT_USERNAME = "Yinhepan_bot"
+MANYUA_BOT_USERNAME = "Yinheximanyoua_bot"
 
-# 填写允许上传归档及执行管理命令的 Telegram 数字 ID（可填多个，用逗号分隔；留空 set() 则不限制）
+MANYUA_DIR = "yinheximanyoua"
+os.makedirs(MANYUA_DIR, exist_ok=True)
+
+# @Yinhepan_bot 配置（原有）
+PAN_DB_FILE = "private_database.db"
+PAN_AD_CONFIG_FILE = "ad_config.json"
+
+# @Yinheximanyoua_bot 配置（独立子目录与独立广告/数据库文件）
+MANYUA_DB_FILE = os.path.join(MANYUA_DIR, "private_database.db")
+MANYUA_AD_CONFIG_FILE = os.path.join(MANYUA_DIR, "ad_config.json")
+
+# 填写 @Yinhepan_bot 管理员数字 ID（留空 set() 则不限制）
 ADMIN_USER_IDS = {
     8790114086,
     970905815,
 }
 
-def is_admin(user_id: int) -> bool:
+def is_pan_admin(user_id: int) -> bool:
     if not ADMIN_USER_IDS:
         return True
     return user_id in ADMIN_USER_IDS
 
-DB_FILE = "private_database.db"
-AD_CONFIG_FILE = "ad_config.json"
-
-PAGE_SIZE = 10          # 每页 10 个文件；总数 <= 10 直接全部下发，> 10 才分页/按需筛选
+PAGE_SIZE = 10          # 每页 10 个文件；<= 10 直接下发，> 10 分页
 MAX_VISIBLE_PAGES = 5   # 首批平铺显示的页码数量，超出折叠为 "6-8" 范围按钮
 
 DEFAULT_AD_CONFIG = {
@@ -51,12 +62,15 @@ DEFAULT_AD_CONFIG = {
     "ads": [],
 }
 
-# 记录每个用户对 (short_code, mode) 已获取过的页码集合：{(chat_id, short_code, mode): {1, 2}}
-FETCHED_PAGES = {}
+# 按 bot_key ("pan" / "manyua") 隔离暂存与分页状态
+UPLOADING_SESSIONS = {"pan": {}, "manyua": {}}
+FETCHED_PAGES = {"pan": {}, "manyua": {}}
+WAITING_AD_USERS = {"pan": set(), "manyua": set()}
+EDITING_AD_INDEX = {"pan": {}, "manyua": {}}
 
-# --- 1. 数据库初始化与存档读写 ---
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
+# --- 1. 数据库读写（支持指定 db_file） ---
+def init_db(db_file):
+    conn = sqlite3.connect(db_file)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS resources (
@@ -68,39 +82,40 @@ def init_db():
     conn.commit()
     conn.close()
 
-init_db()
+init_db(PAN_DB_FILE)
+init_db(MANYUA_DB_FILE)
 
-def db_code_exists(short_code):
-    conn = sqlite3.connect(DB_FILE)
+def db_code_exists(db_file, short_code):
+    conn = sqlite3.connect(db_file)
     cursor = conn.cursor()
     cursor.execute("SELECT 1 FROM resources WHERE short_code = ? LIMIT 1", (short_code,))
     exists = cursor.fetchone() is not None
     conn.close()
     return exists
 
-def generate_unique_short_code(length=8):
+def generate_unique_short_code(db_file, length=8):
     while True:
         code = secrets.token_hex((length + 1) // 2)[:length]
-        if not db_code_exists(code):
+        if not db_code_exists(db_file, code):
             return code
 
-def db_save_resource(short_code, file_list):
-    conn = sqlite3.connect(DB_FILE)
+def db_save_resource(db_file, short_code, file_list):
+    conn = sqlite3.connect(db_file)
     cursor = conn.cursor()
     cursor.execute("INSERT INTO resources (short_code, file_list) VALUES (?, ?)", (short_code, json.dumps(file_list)))
     conn.commit()
     conn.close()
 
-def db_get_resource(short_code):
-    conn = sqlite3.connect(DB_FILE)
+def db_get_resource(db_file, short_code):
+    conn = sqlite3.connect(db_file)
     cursor = conn.cursor()
     cursor.execute("SELECT file_list FROM resources WHERE short_code = ?", (short_code,))
     row = cursor.fetchone()
     conn.close()
     return json.loads(row[0]) if row else None
 
-def db_get_all_resources():
-    conn = sqlite3.connect(DB_FILE)
+def db_get_all_resources(db_file):
+    conn = sqlite3.connect(db_file)
     cursor = conn.cursor()
     cursor.execute("SELECT short_code, file_list, created_at FROM resources ORDER BY created_at DESC")
     rows = cursor.fetchall()
@@ -111,14 +126,14 @@ def db_get_all_resources():
         results.append({"short_code": r[0], "count": len(flist), "created_at": r[2]})
     return results
 
-def db_delete_resource(short_code):
-    conn = sqlite3.connect(DB_FILE)
+def db_delete_resource(db_file, short_code):
+    conn = sqlite3.connect(db_file)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM resources WHERE short_code = ?", (short_code,))
     conn.commit()
     conn.close()
 
-# --- 2. ad_config.json 多广告池读写 ---
+# --- 2. 广告文件读写（支持指定 ad_file） ---
 def clean_ad_url(raw_url):
     if not raw_url:
         return ""
@@ -170,12 +185,15 @@ def normalize_ad_item(item):
         "buttons": buttons,
     }
 
-def load_ad_config():
-    if not os.path.exists(AD_CONFIG_FILE):
-        save_ad_config(DEFAULT_AD_CONFIG)
+def load_ad_config(ad_file):
+    parent = os.path.dirname(ad_file)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    if not os.path.exists(ad_file):
+        save_ad_config(ad_file, DEFAULT_AD_CONFIG)
         return dict(DEFAULT_AD_CONFIG)
     try:
-        with open(AD_CONFIG_FILE, "r", encoding="utf-8") as f:
+        with open(ad_file, "r", encoding="utf-8") as f:
             data = json.load(f)
         if not isinstance(data, dict):
             return dict(DEFAULT_AD_CONFIG)
@@ -194,10 +212,13 @@ def load_ad_config():
 
         return {"enabled": enabled, "ads": ads}
     except Exception as e:
-        logging.error(f"读取 {AD_CONFIG_FILE} 失败: {e}")
+        logging.error(f"读取 {ad_file} 失败: {e}")
         return dict(DEFAULT_AD_CONFIG)
 
-def save_ad_config(config_dict):
+def save_ad_config(ad_file, config_dict):
+    parent = os.path.dirname(ad_file)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     enabled = bool(config_dict.get("enabled", False))
     ads = []
     if isinstance(config_dict.get("ads"), list):
@@ -206,16 +227,17 @@ def save_ad_config(config_dict):
             if norm:
                 ads.append(norm)
     payload = {"enabled": enabled, "ads": ads}
-    with open(AD_CONFIG_FILE, "w", encoding="utf-8") as f:
+    with open(ad_file, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
-load_ad_config()
+load_ad_config(PAN_AD_CONFIG_FILE)
+load_ad_config(MANYUA_AD_CONFIG_FILE)
 
-def get_ads_list():
-    return load_ad_config().get("ads") or []
+def get_ads_list(ad_file):
+    return load_ad_config(ad_file).get("ads") or []
 
-def add_ad_to_config(media_type="text", photo_id="", video_id="", caption="", buttons=None):
-    cfg = load_ad_config()
+def add_ad_to_config(ad_file, media_type="text", photo_id="", video_id="", caption="", buttons=None):
+    cfg = load_ad_config(ad_file)
     new_ad = normalize_ad_item({
         "media_type": media_type or "text",
         "photo_id": photo_id or "",
@@ -227,11 +249,11 @@ def add_ad_to_config(media_type="text", photo_id="", video_id="", caption="", bu
         return None
     ads = cfg.get("ads", [])
     ads.append(new_ad)
-    save_ad_config({"enabled": True, "ads": ads})
+    save_ad_config(ad_file, {"enabled": True, "ads": ads})
     return new_ad
 
-def update_ad_at_index(idx_zero_based, media_type="text", photo_id="", video_id="", caption="", buttons=None):
-    cfg = load_ad_config()
+def update_ad_at_index(ad_file, idx_zero_based, media_type="text", photo_id="", video_id="", caption="", buttons=None):
+    cfg = load_ad_config(ad_file)
     ads = cfg.get("ads") or []
     if idx_zero_based < 0 or idx_zero_based >= len(ads):
         return None
@@ -245,20 +267,20 @@ def update_ad_at_index(idx_zero_based, media_type="text", photo_id="", video_id=
     if not new_ad:
         return None
     ads[idx_zero_based] = new_ad
-    save_ad_config({"enabled": True, "ads": ads})
+    save_ad_config(ad_file, {"enabled": True, "ads": ads})
     return new_ad
 
-def delete_ad_at_index(idx_zero_based):
-    cfg = load_ad_config()
+def delete_ad_at_index(ad_file, idx_zero_based):
+    cfg = load_ad_config(ad_file)
     ads = cfg.get("ads") or []
     if idx_zero_based < 0 or idx_zero_based >= len(ads):
         return False
     ads.pop(idx_zero_based)
-    save_ad_config({"enabled": bool(ads), "ads": ads})
+    save_ad_config(ad_file, {"enabled": bool(ads), "ads": ads})
     return True
 
-def pick_random_ad():
-    cfg = load_ad_config()
+def pick_random_ad(ad_file):
+    cfg = load_ad_config(ad_file)
     if not cfg.get("enabled"):
         return None
     ads = cfg.get("ads") or []
@@ -266,12 +288,8 @@ def pick_random_ad():
         return None
     return random.choice(ads)
 
-def db_delete_ad():
-    save_ad_config(DEFAULT_AD_CONFIG)
-
-UPLOADING_SESSIONS = {}
-WAITING_AD_USERS = set()
-EDITING_AD_INDEX = {}
+def db_delete_ad(ad_file):
+    save_ad_config(ad_file, DEFAULT_AD_CONFIG)
 
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -288,7 +306,7 @@ def run_web_server():
 
 threading.Thread(target=run_web_server, daemon=True).start()
 
-# --- 3. 格式识别、智能分流与分页逻辑 ---
+# --- 3. 格式识别、分页与投递逻辑 ---
 def is_zip_document(document):
     if not document:
         return False
@@ -297,7 +315,6 @@ def is_zip_document(document):
     return fname.endswith(".zip") or mime in {"application/zip", "application/x-zip-compressed"}
 
 def get_present_types(file_list):
-    # 按固定顺序返回实际存在的格式类型：photo, video, zip
     present = []
     for t in ("photo", "video", "zip"):
         if any(x.get("type") == t for x in file_list):
@@ -317,14 +334,15 @@ def get_mode_label(mode):
         "zip": "压缩包",
     }.get(mode, "全部文件")
 
-def mark_page_fetched(chat_id, short_code, mode, page_num):
+def mark_page_fetched(bot_key, chat_id, short_code, mode, page_num):
+    store = FETCHED_PAGES[bot_key]
     key = (chat_id, short_code, mode)
-    if key not in FETCHED_PAGES:
-        FETCHED_PAGES[key] = set()
-    FETCHED_PAGES[key].add(page_num)
+    if key not in store:
+        store[key] = set()
+    store[key].add(page_num)
 
-def get_fetched_set(chat_id, short_code, mode):
-    return FETCHED_PAGES.get((chat_id, short_code, mode), set())
+def get_fetched_set(bot_key, chat_id, short_code, mode):
+    return FETCHED_PAGES[bot_key].get((chat_id, short_code, mode), set())
 
 def format_page_label(page_num, current_page, fetched_set):
     if page_num == current_page:
@@ -333,15 +351,16 @@ def format_page_label(page_num, current_page, fetched_set):
         return f"✅{page_num}"
     return f"{page_num}"
 
-def build_page_keyboard(chat_id, short_code, mode, total_pages, current_page, range_start=1, expand_range=False, show_back_overview=True):
-    fetched_set = get_fetched_set(chat_id, short_code, mode)
+def build_page_keyboard(bot_key, chat_id, short_code, mode, total_pages, current_page, range_start=1, expand_range=False, show_back_overview=True):
+    fetched_set = get_fetched_set(bot_key, chat_id, short_code, mode)
     keyboard = []
+    back_flag = "1" if show_back_overview else "0"
 
     if total_pages <= MAX_VISIBLE_PAGES:
         row = [
             InlineKeyboardButton(
                 format_page_label(p, current_page, fetched_set),
-                callback_data=f"page|{mode}|{short_code}|{p}|0|0|{'1' if show_back_overview else '0'}"
+                callback_data=f"page|{mode}|{short_code}|{p}|0|0|{back_flag}"
             )
             for p in range(1, total_pages + 1)
         ]
@@ -351,7 +370,7 @@ def build_page_keyboard(chat_id, short_code, mode, total_pages, current_page, ra
             first_row = [
                 InlineKeyboardButton(
                     format_page_label(p, current_page, fetched_set),
-                    callback_data=f"page|{mode}|{short_code}|{p}|0|0|{'1' if show_back_overview else '0'}"
+                    callback_data=f"page|{mode}|{short_code}|{p}|0|0|{back_flag}"
                 )
                 for p in range(1, MAX_VISIBLE_PAGES + 1)
             ]
@@ -372,7 +391,7 @@ def build_page_keyboard(chat_id, short_code, mode, total_pages, current_page, ra
                 range_row.append(
                     InlineKeyboardButton(
                         label,
-                        callback_data=f"range|{mode}|{short_code}|{current_page}|{rem_start}|{rem_end}|{'1' if show_back_overview else '0'}"
+                        callback_data=f"range|{mode}|{short_code}|{current_page}|{rem_start}|{rem_end}|{back_flag}"
                     )
                 )
                 rem_start = rem_end + 1
@@ -381,7 +400,7 @@ def build_page_keyboard(chat_id, short_code, mode, total_pages, current_page, ra
             expanded_row = [
                 InlineKeyboardButton(
                     format_page_label(p, current_page, fetched_set),
-                    callback_data=f"page|{mode}|{short_code}|{p}|{range_start}|1|{'1' if show_back_overview else '0'}"
+                    callback_data=f"page|{mode}|{short_code}|{p}|{range_start}|1|{back_flag}"
                 )
                 for p in range(range_start, min(range_start + MAX_VISIBLE_PAGES, total_pages + 1))
             ]
@@ -389,7 +408,7 @@ def build_page_keyboard(chat_id, short_code, mode, total_pages, current_page, ra
             keyboard.append([
                 InlineKeyboardButton(
                     "↩️ 返回 1-5 页码",
-                    callback_data=f"page|{mode}|{short_code}|{current_page}|1|0|{'1' if show_back_overview else '0'}"
+                    callback_data=f"page|{mode}|{short_code}|{current_page}|1|0|{back_flag}"
                 )
             ])
 
@@ -400,10 +419,8 @@ def build_page_keyboard(chat_id, short_code, mode, total_pages, current_page, ra
     return InlineKeyboardMarkup(keyboard)
 
 async def send_items_batch(chat_id, context, items):
-    # photo/video 走媒体组；zip 逐个发送文档（或 photo/video 混发）
     media_group = []
     zip_items = []
-
     for x in items:
         if x.get("type") in ("photo", "video"):
             media_group.append(x)
@@ -425,7 +442,7 @@ async def send_items_batch(chat_id, context, items):
             filename=z.get("file_name") or None,
         )
 
-async def send_page_with_bar(chat_id, context, file_list, short_code, mode, page_num, range_start=1, expand_range=False, show_back_overview=True):
+async def send_page_with_bar(bot_key, chat_id, context, file_list, short_code, mode, page_num, range_start=1, expand_range=False, show_back_overview=True):
     filtered = get_filtered_files(file_list, mode)
     total_items = len(filtered)
     if total_items == 0:
@@ -437,7 +454,7 @@ async def send_page_with_bar(chat_id, context, file_list, short_code, mode, page
         await context.bot.send_message(chat_id=chat_id, text="❌ 页码超出范围。")
         return
 
-    mark_page_fetched(chat_id, short_code, mode, page_num)
+    mark_page_fetched(bot_key, chat_id, short_code, mode, page_num)
 
     start_idx = (page_num - 1) * PAGE_SIZE
     end_idx = min(start_idx + PAGE_SIZE, total_items)
@@ -452,7 +469,7 @@ async def send_page_with_bar(chat_id, context, file_list, short_code, mode, page
     if total_pages <= 1 and not show_back_overview:
         return
 
-    fetched_set = get_fetched_set(chat_id, short_code, mode)
+    fetched_set = get_fetched_set(bot_key, chat_id, short_code, mode)
     fetched_str = "、".join(str(p) for p in sorted(fetched_set)) if fetched_set else "无"
     bar_text = (
         f"📄 **{get_mode_label(mode)}** · 当前第 **{page_num}/{total_pages}** 页（第 {start_idx + 1}～{end_idx} 个，共 {total_items} 个）\n"
@@ -460,7 +477,7 @@ async def send_page_with_bar(chat_id, context, file_list, short_code, mode, page
         f"👇 点击下方页码切换或继续获取："
     )
     markup = build_page_keyboard(
-        chat_id, short_code, mode, total_pages,
+        bot_key, chat_id, short_code, mode, total_pages,
         current_page=page_num,
         range_start=range_start,
         expand_range=expand_range,
@@ -513,13 +530,7 @@ def build_multi_type_selector_payload(short_code, file_list):
 
     return overview_text, InlineKeyboardMarkup(keyboard)
 
-async def deliver_resource_smart(chat_id, context, short_code, file_list):
-    """
-    智能分流规则：
-    1. 文件总数 <= 10 个：直接全部下发，无需选择。
-    2. 文件总数 > 10 个，且只有 1 种格式：跳过格式选择，直接下发该格式第 1 页（附带页码条）。
-    3. 文件总数 > 10 个，且有 >= 2 种格式：展示格式选择按钮。
-    """
+async def deliver_pan_resource(chat_id, context, short_code, file_list):
     total_count = len(file_list)
     if total_count == 0:
         await context.bot.send_message(chat_id=chat_id, text="📂 该存档为空。")
@@ -534,10 +545,9 @@ async def deliver_resource_smart(chat_id, context, short_code, file_list):
 
     present_types = get_present_types(file_list)
     if len(present_types) == 1:
-        single_mode = present_types[0]
         await send_page_with_bar(
-            chat_id, context, file_list, short_code,
-            mode=single_mode, page_num=1,
+            "pan", chat_id, context, file_list, short_code,
+            mode=present_types[0], page_num=1,
             range_start=1, expand_range=False,
             show_back_overview=False
         )
@@ -546,7 +556,33 @@ async def deliver_resource_smart(chat_id, context, short_code, file_list):
     overview_text, markup = build_multi_type_selector_payload(short_code, file_list)
     await context.bot.send_message(chat_id=chat_id, text=overview_text, reply_markup=markup, parse_mode="Markdown")
 
-# --- 4. 多广告展示、管理与多按钮解析 ---
+async def deliver_manyua_resource(chat_id, context, short_code, file_list):
+    """
+    @Yinheximanyoua_bot 提取规则：
+    - 无需分类选择，直接按全部文件下发
+    - <= 10 个：直接全部下发
+    - > 10 个：直接下发第 1 页并附带与 @Yinhepan_bot 一样的页码栏，由用户点击页码切换
+    """
+    total_count = len(file_list)
+    if total_count == 0:
+        await context.bot.send_message(chat_id=chat_id, text="📂 该存档为空。")
+        return
+
+    if total_count <= PAGE_SIZE:
+        try:
+            await send_items_batch(chat_id, context, file_list)
+        except Exception as e:
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ 下发出错: {e}")
+        return
+
+    await send_page_with_bar(
+        "manyua", chat_id, context, file_list, short_code,
+        mode="all", page_num=1,
+        range_start=1, expand_range=False,
+        show_back_overview=False
+    )
+
+# --- 4. 广告展示、管理与解析 ---
 def build_ad_keyboard(buttons):
     if not buttons:
         return None
@@ -600,8 +636,8 @@ async def send_specific_ad(chat_id, context, ad, is_preview=False):
                 parse_mode="Markdown",
             )
 
-async def send_ad_to_user(chat_id, context, is_preview=False):
-    ad = pick_random_ad()
+async def send_ad_to_user(ad_file, chat_id, context, is_preview=False):
+    ad = pick_random_ad(ad_file)
     await send_specific_ad(chat_id, context, ad, is_preview=is_preview)
 
 def _extract_buttons_from_line(line):
@@ -637,8 +673,8 @@ def parse_ad_text(raw_text):
     caption = "\n".join(lines[:split_idx]).strip()
     return caption, collected_buttons
 
-def build_ad_list_payload():
-    cfg = load_ad_config()
+def build_ad_list_payload(ad_file):
+    cfg = load_ad_config(ad_file)
     ads = cfg.get("ads") or []
     if not ads:
         return "📭 当前广告池为空（0 条广告）。发送 `/setad` 可添加。", None
@@ -659,157 +695,40 @@ def build_ad_list_payload():
             InlineKeyboardButton(f"🗑️ 删除 #{i}", callback_data=f"addel|{i}"),
         ])
 
-    lines.append("\n💡 修改某条请发 `/editad 序号`（如 `/editad 1`）；删除某条可点按钮或发 `/delad 序号`；清空全部发 `/delad`。")
+    lines.append("\n💡 修改某条请发 `/editad 序号`；删除某条可点按钮或发 `/delad 序号`；清空全部发 `/delad`。")
     return "\n".join(lines), InlineKeyboardMarkup(keyboard)
 
-async def listad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    text, markup = build_ad_list_payload()
-    await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+# --- 5. 构建单个 Bot 的处理器工厂 ---
+def build_bot_handlers(bot_key, bot_username, db_file, ad_file, require_admin_for_upload):
+    def can_manage(user_id):
+        if bot_key == "pan":
+            return is_pan_admin(user_id)
+        # @Yinheximanyoua_bot 面向用户开放，若设置了 ADMIN_USER_IDS 则只限白名单管理广告；未设置则允许使用
+        return True
 
-async def editad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        return
-    ads = get_ads_list()
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text(f"⚠️ 请指定广告序号，例如 `/editad 1`（当前共 {len(ads)} 条）。", parse_mode="Markdown")
-        return
-    seq = int(context.args[0])
-    if seq < 1 or seq > len(ads):
-        await update.message.reply_text(f"❌ 序号 `{seq}` 不存在，当前有效范围为 `1`～`{len(ads)}`。", parse_mode="Markdown")
-        return
+    def can_upload(user_id):
+        if require_admin_for_upload:
+            return is_pan_admin(user_id)
+        return True
 
-    WAITING_AD_USERS.discard(user_id)
-    EDITING_AD_INDEX[user_id] = seq - 1
-    await update.message.reply_text(
-        f"✏️ **正在修改第 #{seq} 条广告**\n请发送新的纯文本、带说明的图片或视频（末尾可附带按钮），将直接替换第 #{seq} 条。\n发送 `/cancelad` 可取消。",
-        parse_mode="Markdown",
-    )
+    async def stage_file(message, chat_id, file_item):
+        sessions = UPLOADING_SESSIONS[bot_key]
+        if chat_id not in sessions:
+            sessions[chat_id] = {"files": [], "msg_id": None}
+        sessions[chat_id]["files"].append(file_item)
+        total_count = len(sessions[chat_id]["files"])
 
-async def setad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        return
-    EDITING_AD_INDEX.pop(user_id, None)
-    WAITING_AD_USERS.add(user_id)
-    guide_text = (
-        "📢 **进入广告添加模式（支持多广告随机 + 多按钮）**\n\n"
-        "请发送**纯文本**、**带说明的图片**或**带说明的视频**，末尾可写一个或多个按钮（支持多行或用 `；` 分隔）：\n\n"
-        "```\n"
-        "精选资源每日更新，欢迎加入！\n"
-        "主频道|[https://t.me/jisogd](https://t.me/jisogd)；备用群|[https://t.me/your_group](https://t.me/your_group)\n"
-        "```\n"
-        "💡 **说明**：\n"
-        "• 每次添加会自动分配序号（`#1`, `#2`...）并写入 `ad_config.json`。\n"
-        "• 发送 `/listad` 查看序号、`/editad 序号` 修改单条、`/delad 序号` 删除单条、`/delad` 清空全部、`/cancelad` 取消。"
-    )
-    await update.message.reply_text(guide_text, parse_mode="Markdown")
-
-async def cancelad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    was_waiting = user_id in WAITING_AD_USERS
-    was_editing = user_id in EDITING_AD_INDEX
-    WAITING_AD_USERS.discard(user_id)
-    EDITING_AD_INDEX.pop(user_id, None)
-    if was_waiting or was_editing:
-        await update.message.reply_text("❎ 已退出广告设置/修改模式。")
-
-async def delad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    ads = get_ads_list()
-    if context.args:
-        if not context.args[0].isdigit():
-            await update.message.reply_text("⚠️ 序号须为数字，例如 `/delad 2`；不带数字 `/delad` 则清空全部广告。", parse_mode="Markdown")
-            return
-        seq = int(context.args[0])
-        if seq < 1 or seq > len(ads):
-            await update.message.reply_text(f"❌ 序号 `{seq}` 不存在，当前有效范围为 `1`～`{len(ads)}`。", parse_mode="Markdown")
-            return
-        if delete_ad_at_index(seq - 1):
-            await update.message.reply_text(f"🗑️ 已删除第 **#{seq}** 条广告并更新 `ad_config.json`。", parse_mode="Markdown")
-        return
-
-    db_delete_ad()
-    await update.message.reply_text("🗑️ 已清空 `ad_config.json` 中的全部广告。")
-
-async def handle_incoming_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if not message or not message.text:
-        return
-    user_id = message.from_user.id
-    if user_id in EDITING_AD_INDEX:
-        idx = EDITING_AD_INDEX.pop(user_id)
-        caption, buttons = parse_ad_text(message.text)
-        saved_ad = update_ad_at_index(idx, media_type="text", caption=caption, buttons=buttons)
-        if saved_ad:
-            await message.reply_text(f"✅ **已更新第 #{idx + 1} 条广告（纯文本）！** 预览如下：")
-            await send_specific_ad(message.chat_id, context, saved_ad, is_preview=True)
-        else:
-            await message.reply_text("❌ 更新失败：广告内容为空或序号已失效。")
-        return
-
-    if user_id in WAITING_AD_USERS:
-        WAITING_AD_USERS.remove(user_id)
-        caption, buttons = parse_ad_text(message.text)
-        saved_ad = add_ad_to_config(media_type="text", caption=caption, buttons=buttons)
-        total_ads = len(get_ads_list())
-        await message.reply_text(f"✅ **纯文本广告已加入广告池（编号 #{total_ads}，共 {total_ads} 条）！** 预览如下：")
-        await send_specific_ad(message.chat_id, context, saved_ad, is_preview=True)
-
-async def handle_incoming_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if not message or not message.document:
-        return
-    document = message.document
-    chat_id = message.chat_id
-    user_id = message.from_user.id
-
-    if document.file_name and document.file_name.endswith(".db"):
-        if not is_admin(user_id):
-            return
-        file = await context.bot.get_file(document.file_id)
-        await file.download_to_drive(DB_FILE)
-        init_db()
-        await message.reply_text("✅ **数据库恢复成功！**\n已成功加载您上传的数据库文件，所有历史存档已恢复在线。")
-        return
-
-    if document.file_name == AD_CONFIG_FILE:
-        if not is_admin(user_id):
-            return
-        file = await context.bot.get_file(document.file_id)
-        await file.download_to_drive(AD_CONFIG_FILE)
-        cfg = load_ad_config()
-        await message.reply_text(f"✅ **广告配置文件 `ad_config.json` 已加载生效（共 {len(cfg.get('ads', []))} 条广告）！** 随机预览如下：")
-        await send_ad_to_user(chat_id, context, is_preview=True)
-        return
-
-    if is_zip_document(document):
-        if not is_admin(user_id):
-            return
-        if chat_id not in UPLOADING_SESSIONS:
-            UPLOADING_SESSIONS[chat_id] = {"files": [], "msg_id": None}
-
-        UPLOADING_SESSIONS[chat_id]["files"].append({
-            "type": "zip",
-            "file_id": document.file_id,
-            "file_name": document.file_name or "archive.zip",
-            "size": document.file_size or 0,
-        })
-        total_count = len(UPLOADING_SESSIONS[chat_id]["files"])
         text = f"📥 **正在归档...**\n已暂存：**{total_count}** 个文件"
-        keyboard = [[InlineKeyboardButton("✅ 归档完毕，生成永久存档", callback_data="finish_group")]]
+        keyboard = [[InlineKeyboardButton("✅ 确认数量，生成不重复识别码", callback_data="finish_group")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        current_msg_id = UPLOADING_SESSIONS[chat_id]["msg_id"]
+        current_msg_id = sessions[chat_id]["msg_id"]
         try:
             if current_msg_id is None:
                 sent_msg = await message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
-                UPLOADING_SESSIONS[chat_id]["msg_id"] = sent_msg.message_id
+                sessions[chat_id]["msg_id"] = sent_msg.message_id
             else:
-                await context.bot.edit_message_text(
+                await message.bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=current_msg_id,
                     text=text,
@@ -818,318 +737,458 @@ async def handle_incoming_document(update: Update, context: ContextTypes.DEFAULT
                 )
         except Exception:
             sent_msg = await message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
-            UPLOADING_SESSIONS[chat_id]["msg_id"] = sent_msg.message_id
-        return
+            sessions[chat_id]["msg_id"] = sent_msg.message_id
 
-    if is_admin(user_id):
-        await message.reply_text("📂 仅支持归档图片、视频与 `.zip` 压缩包（或上传 `.db` / `ad_config.json` 恢复）。")
-
-async def handle_incoming_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if not message:
-        return
-    chat_id = message.chat_id
-    user_id = message.from_user.id
-
-    if not is_admin(user_id):
-        return
-
-    if user_id in EDITING_AD_INDEX and (message.photo or message.video):
-        idx = EDITING_AD_INDEX.pop(user_id)
-        caption, buttons = parse_ad_text(message.caption or "")
-        if message.video:
-            saved_ad = update_ad_at_index(idx, media_type="video", video_id=message.video.file_id, caption=caption, buttons=buttons)
-            label = "视频广告"
-        else:
-            saved_ad = update_ad_at_index(idx, media_type="photo", photo_id=message.photo[-1].file_id, caption=caption, buttons=buttons)
-            label = "图文广告"
-        if saved_ad:
-            await message.reply_text(f"✅ **已更新第 #{idx + 1} 条广告（{label}）！** 预览如下：")
-            await send_specific_ad(chat_id, context, saved_ad, is_preview=True)
-        else:
-            await message.reply_text("❌ 更新失败：序号已失效。")
-        return
-
-    if user_id in WAITING_AD_USERS and (message.photo or message.video):
-        WAITING_AD_USERS.remove(user_id)
-        caption, buttons = parse_ad_text(message.caption or "")
-        if message.video:
-            video_id = message.video.file_id
-            saved_ad = add_ad_to_config(media_type="video", video_id=video_id, caption=caption, buttons=buttons)
-            label = "视频广告"
-        else:
-            photo_id = message.photo[-1].file_id
-            saved_ad = add_ad_to_config(media_type="photo", photo_id=photo_id, caption=caption, buttons=buttons)
-            label = "图文广告"
-        total_ads = len(get_ads_list())
-        await message.reply_text(f"✅ **{label}已加入广告池（编号 #{total_ads}，共 {total_ads} 条）！** 预览如下：")
-        await send_specific_ad(chat_id, context, saved_ad, is_preview=True)
-        return
-
-    file_size = 0
-    if message.photo:
-        file_id = message.photo[-1].file_id
-        file_type = "photo"
-        file_size = message.photo[-1].file_size or 0
-    elif message.video:
-        file_id = message.video.file_id
-        file_type = "video"
-        file_size = message.video.file_size or 0
-    else:
-        return
-
-    if chat_id not in UPLOADING_SESSIONS:
-        UPLOADING_SESSIONS[chat_id] = {"files": [], "msg_id": None}
-
-    UPLOADING_SESSIONS[chat_id]["files"].append({
-        "type": file_type,
-        "file_id": file_id,
-        "size": file_size,
-    })
-    total_count = len(UPLOADING_SESSIONS[chat_id]["files"])
-
-    text = f"📥 **正在归档...**\n已暂存：**{total_count}** 个文件"
-    keyboard = [[InlineKeyboardButton("✅ 归档完毕，生成永久存档", callback_data="finish_group")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    current_msg_id = UPLOADING_SESSIONS[chat_id]["msg_id"]
-    try:
-        if current_msg_id is None:
-            sent_msg = await message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
-            UPLOADING_SESSIONS[chat_id]["msg_id"] = sent_msg.message_id
-        else:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=current_msg_id,
-                text=text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown",
-            )
-    except Exception:
-        sent_msg = await message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
-        UPLOADING_SESSIONS[chat_id]["msg_id"] = sent_msg.message_id
-
-async def show_glwj_panel(message_obj, edit=False):
-    resources = db_get_all_resources()
-    if not resources:
-        text = "📂 目前没有任何存档记录。"
-        if edit:
-            await message_obj.edit_text(text)
-        else:
-            await message_obj.reply_text(text)
-        return
-
-    text = f"🛠️ **存档复查后台**\n共找到 {len(resources)} 组存档："
-    keyboard = [
-        [
-            InlineKeyboardButton(f"📁 码:{i['short_code']} ({i['count']}个)", callback_data=f"view_{i['short_code']}"),
-            InlineKeyboardButton("❌ 删除", callback_data=f"del_{i['short_code']}"),
-        ]
-        for i in resources
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    if edit:
-        await message_obj.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
-    else:
-        await message_obj.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat_id
-    user_id = query.from_user.id
-    data = query.data
-
-    if data.startswith("adprev|"):
-        if not is_admin(user_id):
+    async def setad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if not can_manage(user_id):
             return
-        seq = int(data.split("|")[1])
-        ads = get_ads_list()
-        if 1 <= seq <= len(ads):
-            await context.bot.send_message(chat_id=chat_id, text=f"👀 **预览第 #{seq} 条广告：**", parse_mode="Markdown")
-            await send_specific_ad(chat_id, context, ads[seq - 1], is_preview=True)
-        else:
-            await context.bot.send_message(chat_id=chat_id, text="⚠️ 该条广告已不存在。")
-        return
-
-    if data.startswith("addel|"):
-        if not is_admin(user_id):
-            return
-        seq = int(data.split("|")[1])
-        if delete_ad_at_index(seq - 1):
-            text, markup = build_ad_list_payload()
-            if markup:
-                await query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
-            else:
-                await query.message.edit_text(text, parse_mode="Markdown")
-        else:
-            await context.bot.send_message(chat_id=chat_id, text="⚠️ 该条广告已不存在。")
-        return
-
-    if data == "finish_group":
-        session_data = UPLOADING_SESSIONS.get(chat_id, {"files": [], "msg_id": None})
-        session_files = session_data["files"]
-
-        if not session_files:
-            await query.message.edit_text("✅ 该组文件已经成功打包过了。")
-            return
-
-        short_code = generate_unique_short_code(8)
-        db_save_resource(short_code, session_files)
-        UPLOADING_SESSIONS[chat_id] = {"files": [], "msg_id": None}
-
-        raw_link = f"https://t.me/{BOT_USERNAME}?start={short_code}"
-        text = (
-            f"🎉 **归档成功！**\n"
-            f"🔑 识别码：`{short_code}`\n\n"
-            f"🔗 **提取链接**（点击下方代码即可复制）：\n"
-            f"`{raw_link}`"
-        )
-
-        keyboard = [
-            [InlineKeyboardButton("🔗 一键提取查看", url=raw_link)],
-            [InlineKeyboardButton("🛠️ 进入管理后台", callback_data="goto_glwj")],
-        ]
-
-        try:
-            await query.message.edit_text("✅ **本组文件已打包入库完成！**", reply_markup=None)
-        except Exception:
-            pass
-
-        await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-
-    elif data == "goto_glwj":
-        await show_glwj_panel(query.message, edit=True)
-    elif data.startswith("del_"):
-        code = data.split("_")[1]
-        db_delete_resource(code)
-        await query.message.edit_text(f"🗑️ 已删除码 `{code}` 的存档。", parse_mode="Markdown")
-    elif data.startswith("view_"):
-        code = data.split("_")[1]
-        file_list = db_get_resource(code)
-        if file_list:
-            raw_link = f"https://t.me/{BOT_USERNAME}?start={code}"
-            await query.message.reply_text(f"📌 存档 `{code}`\n总数：{len(file_list)}个\n链接：\n`{raw_link}`", parse_mode="Markdown")
-
-    elif data.startswith("page|"):
-        parts = data.split("|")
-        _, mode, code, page_s, range_start_s, expand_s = parts[:6]
-        show_back = (parts[6] == "1") if len(parts) > 6 else True
-        file_list = db_get_resource(code)
-        if not file_list:
-            await query.message.reply_text("❌ 存档已失效。")
-            return
-        await send_page_with_bar(
-            chat_id, context, file_list, code, mode,
-            page_num=int(page_s),
-            range_start=int(range_start_s) or 1,
-            expand_range=(expand_s == "1"),
-            show_back_overview=show_back,
-        )
-
-    elif data.startswith("range|"):
-        parts = data.split("|")
-        _, mode, code, cur_page_s, rem_start_s, rem_end_s = parts[:6]
-        show_back = (parts[6] == "1") if len(parts) > 6 else True
-        file_list = db_get_resource(code)
-        if not file_list:
-            await query.message.edit_text("❌ 存档已失效。")
-            return
-        filtered = get_filtered_files(file_list, mode)
-        total_pages = math.ceil(len(filtered) / PAGE_SIZE)
-        markup = build_page_keyboard(
-            chat_id, code, mode, total_pages,
-            current_page=int(cur_page_s),
-            range_start=int(rem_start_s),
-            expand_range=True,
-            show_back_overview=show_back,
-        )
-        await query.message.edit_reply_markup(reply_markup=markup)
-
-    elif data.startswith("backoverview|"):
-        _, code = data.split("|")
-        file_list = db_get_resource(code)
-        if not file_list:
-            await query.message.edit_text("❌ 存档已失效。")
-            return
-        overview_text, markup = build_multi_type_selector_payload(code, file_list)
-        await query.message.edit_text(overview_text, reply_markup=markup, parse_mode="Markdown")
-
-async def glwj_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    await show_glwj_panel(update.message, edit=False)
-
-async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if not is_admin(update.effective_user.id):
-        return
-
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=f,
-                    caption="📦 【手动备份】这是您当前的数据库文件。",
-                )
-        except Exception as e:
-            await update.message.reply_text(f"❌ 发送备份文件失败: {e}")
-    else:
-        await update.message.reply_text("❌ 当前还没有生成数据库文件。")
-
-    if os.path.exists(AD_CONFIG_FILE):
-        try:
-            with open(AD_CONFIG_FILE, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=f,
-                    caption="📢 【广告配置】这是您当前的 ad_config.json 多广告配置文件。",
-                )
-        except Exception as e:
-            await update.message.reply_text(f"❌ 发送广告配置文件失败: {e}")
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    chat_id = update.effective_chat.id
-    if args:
-        short_code = args[0]
-        file_list = db_get_resource(short_code)
-        if file_list:
-            await deliver_resource_smart(chat_id, context, short_code, file_list)
-            await send_ad_to_user(chat_id, context, is_preview=False)
-        else:
-            await update.message.reply_text("❌ 未找到该存档记录，可能已失效。")
-    else:
+        EDITING_AD_INDEX[bot_key].pop(user_id, None)
+        WAITING_AD_USERS[bot_key].add(user_id)
         await update.message.reply_text(
-            "🔐 私人云盘就绪。直接发送图片、视频或 `.zip` 压缩包开始归档。\n\n"
-            "• `/glwj` - 管理已有存档\n"
-            "• `/setad` - 添加广告到广告池（随机展示）\n"
-            "• `/listad` - 查看广告列表与序号\n"
-            "• `/editad 序号` - 修改指定序号的广告\n"
-            "• `/delad [序号]` - 删除指定序号广告（不带序号则清空全部）\n"
-            "• `/backup` - 打包下载数据库与 ad_config.json"
+            f"📢 **进入广告添加模式（独立文件：`{ad_file}`）**\n\n"
+            "请发送纯文本、带说明的图片或视频，末尾可写一个或多个 `按钮名|链接`（支持多行或 `；` 分隔）：\n"
+            "```\n"
+            "精选资源每日更新，欢迎加入！\n"
+            "主频道|[https://t.me/jisogd](https://t.me/jisogd)；备用群|[https://t.me/your_group](https://t.me/your_group)\n"
+            "```\n"
+            "发送 `/cancelad` 取消。",
+            parse_mode="Markdown",
         )
+
+    async def cancelad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        w = WAITING_AD_USERS[bot_key].discard(user_id)
+        e = EDITING_AD_INDEX[bot_key].pop(user_id, None)
+        if w is not None or e is not None:
+            await update.message.reply_text("❎ 已退出广告设置/修改模式。")
+
+    async def listad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not can_manage(update.effective_user.id):
+            return
+        text, markup = build_ad_list_payload(ad_file)
+        await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+
+    async def editad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        if not can_manage(user_id):
+            return
+        ads = get_ads_list(ad_file)
+        if not context.args or not context.args[0].isdigit():
+            await update.message.reply_text(f"⚠️ 请指定序号，例如 `/editad 1`（当前共 {len(ads)} 条）。", parse_mode="Markdown")
+            return
+        seq = int(context.args[0])
+        if seq < 1 or seq > len(ads):
+            await update.message.reply_text(f"❌ 序号 `{seq}` 不存在，有效范围为 `1`～`{len(ads)}`。", parse_mode="Markdown")
+            return
+        WAITING_AD_USERS[bot_key].discard(user_id)
+        EDITING_AD_INDEX[bot_key][user_id] = seq - 1
+        await update.message.reply_text(
+            f"✏️ **正在修改第 #{seq} 条广告**\n请发送新的纯文本、带说明的图片或视频（末尾可附带按钮）。发送 `/cancelad` 取消。",
+            parse_mode="Markdown",
+        )
+
+    async def delad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not can_manage(update.effective_user.id):
+            return
+        ads = get_ads_list(ad_file)
+        if context.args:
+            if not context.args[0].isdigit():
+                await update.message.reply_text("⚠️ 序号须为数字，例如 `/delad 2`；不带数字 `/delad` 清空全部。", parse_mode="Markdown")
+                return
+            seq = int(context.args[0])
+            if seq < 1 or seq > len(ads):
+                await update.message.reply_text(f"❌ 序号 `{seq}` 不存在，有效范围为 `1`～`{len(ads)}`。", parse_mode="Markdown")
+                return
+            if delete_ad_at_index(ad_file, seq - 1):
+                await update.message.reply_text(f"🗑️ 已删除第 **#{seq}** 条广告。", parse_mode="Markdown")
+            return
+        db_delete_ad(ad_file)
+        await update.message.reply_text("🗑️ 已清空全部广告。")
+
+    async def handle_incoming_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        if not message or not message.text:
+            return
+        user_id = message.from_user.id
+        if user_id in EDITING_AD_INDEX[bot_key]:
+            idx = EDITING_AD_INDEX[bot_key].pop(user_id)
+            caption, buttons = parse_ad_text(message.text)
+            saved_ad = update_ad_at_index(ad_file, idx, media_type="text", caption=caption, buttons=buttons)
+            if saved_ad:
+                await message.reply_text(f"✅ **已更新第 #{idx + 1} 条广告（纯文本）！** 预览如下：")
+                await send_specific_ad(message.chat_id, context, saved_ad, is_preview=True)
+            else:
+                await message.reply_text("❌ 更新失败：内容为空或序号已失效。")
+            return
+
+        if user_id in WAITING_AD_USERS[bot_key]:
+            WAITING_AD_USERS[bot_key].remove(user_id)
+            caption, buttons = parse_ad_text(message.text)
+            saved_ad = add_ad_to_config(ad_file, media_type="text", caption=caption, buttons=buttons)
+            total_ads = len(get_ads_list(ad_file))
+            await message.reply_text(f"✅ **纯文本广告已加入广告池（编号 #{total_ads}，共 {total_ads} 条）！** 预览如下：")
+            await send_specific_ad(message.chat_id, context, saved_ad, is_preview=True)
+
+    async def handle_incoming_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        if not message or not message.document:
+            return
+        document = message.document
+        chat_id = message.chat_id
+        user_id = message.from_user.id
+
+        if document.file_name and document.file_name.endswith(".db"):
+            if not can_manage(user_id):
+                return
+            file = await context.bot.get_file(document.file_id)
+            await file.download_to_drive(db_file)
+            init_db(db_file)
+            await message.reply_text("✅ **数据库恢复成功！**")
+            return
+
+        if document.file_name == os.path.basename(ad_file):
+            if not can_manage(user_id):
+                return
+            file = await context.bot.get_file(document.file_id)
+            await file.download_to_drive(ad_file)
+            cfg = load_ad_config(ad_file)
+            await message.reply_text(f"✅ **广告配置已加载生效（共 {len(cfg.get('ads', []))} 条）！** 随机预览如下：")
+            await send_ad_to_user(ad_file, chat_id, context, is_preview=True)
+            return
+
+        if is_zip_document(document):
+            if not can_upload(user_id):
+                return
+            await stage_file(message, chat_id, {
+                "type": "zip",
+                "file_id": document.file_id,
+                "file_name": document.file_name or "archive.zip",
+                "size": document.file_size or 0,
+            })
+            return
+
+        if can_manage(user_id):
+            await message.reply_text("📂 仅支持归档图片、视频与 `.zip` 压缩包（或上传 `.db` / 广告配置恢复）。")
+
+    async def handle_incoming_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        message = update.message
+        if not message:
+            return
+        chat_id = message.chat_id
+        user_id = message.from_user.id
+
+        if user_id in EDITING_AD_INDEX[bot_key] and (message.photo or message.video):
+            if not can_manage(user_id):
+                return
+            idx = EDITING_AD_INDEX[bot_key].pop(user_id)
+            caption, buttons = parse_ad_text(message.caption or "")
+            if message.video:
+                saved_ad = update_ad_at_index(ad_file, idx, media_type="video", video_id=message.video.file_id, caption=caption, buttons=buttons)
+                label = "视频广告"
+            else:
+                saved_ad = update_ad_at_index(ad_file, idx, media_type="photo", photo_id=message.photo[-1].file_id, caption=caption, buttons=buttons)
+                label = "图文广告"
+            if saved_ad:
+                await message.reply_text(f"✅ **已更新第 #{idx + 1} 条广告（{label}）！** 预览如下：")
+                await send_specific_ad(chat_id, context, saved_ad, is_preview=True)
+            else:
+                await message.reply_text("❌ 更新失败：序号已失效。")
+            return
+
+        if user_id in WAITING_AD_USERS[bot_key] and (message.photo or message.video):
+            if not can_manage(user_id):
+                return
+            WAITING_AD_USERS[bot_key].remove(user_id)
+            caption, buttons = parse_ad_text(message.caption or "")
+            if message.video:
+                saved_ad = add_ad_to_config(ad_file, media_type="video", video_id=message.video.file_id, caption=caption, buttons=buttons)
+                label = "视频广告"
+            else:
+                saved_ad = add_ad_to_config(ad_file, media_type="photo", photo_id=message.photo[-1].file_id, caption=caption, buttons=buttons)
+                label = "图文广告"
+            total_ads = len(get_ads_list(ad_file))
+            await message.reply_text(f"✅ **{label}已加入广告池（编号 #{total_ads}，共 {total_ads} 条）！** 预览如下：")
+            await send_specific_ad(chat_id, context, saved_ad, is_preview=True)
+            return
+
+        if not can_upload(user_id):
+            return
+
+        if message.photo:
+            await stage_file(message, chat_id, {
+                "type": "photo",
+                "file_id": message.photo[-1].file_id,
+                "size": message.photo[-1].file_size or 0,
+            })
+        elif message.video:
+            await stage_file(message, chat_id, {
+                "type": "video",
+                "file_id": message.video.file_id,
+                "size": message.video.file_size or 0,
+            })
+
+    async def show_glwj_panel(message_obj, edit=False):
+        resources = db_get_all_resources(db_file)
+        if not resources:
+            text = "📂 目前没有任何存档记录。"
+            if edit:
+                await message_obj.edit_text(text)
+            else:
+                await message_obj.reply_text(text)
+            return
+
+        text = f"🛠️ **存档复查后台**\n共找到 {len(resources)} 组存档："
+        keyboard = [
+            [
+                InlineKeyboardButton(f"📁 码:{i['short_code']} ({i['count']}个)", callback_data=f"view_{i['short_code']}"),
+                InlineKeyboardButton("❌ 删除", callback_data=f"del_{i['short_code']}"),
+            ]
+            for i in resources
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        if edit:
+            await message_obj.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        else:
+            await message_obj.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+    async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        chat_id = query.message.chat_id
+        user_id = query.from_user.id
+        data = query.data
+
+        if data.startswith("adprev|"):
+            if not can_manage(user_id):
+                return
+            seq = int(data.split("|")[1])
+            ads = get_ads_list(ad_file)
+            if 1 <= seq <= len(ads):
+                await context.bot.send_message(chat_id=chat_id, text=f"👀 **预览第 #{seq} 条广告：**", parse_mode="Markdown")
+                await send_specific_ad(chat_id, context, ads[seq - 1], is_preview=True)
+            else:
+                await context.bot.send_message(chat_id=chat_id, text="⚠️ 该条广告已不存在。")
+            return
+
+        if data.startswith("addel|"):
+            if not can_manage(user_id):
+                return
+            seq = int(data.split("|")[1])
+            if delete_ad_at_index(ad_file, seq - 1):
+                text, markup = build_ad_list_payload(ad_file)
+                if markup:
+                    await query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+                else:
+                    await query.message.edit_text(text, parse_mode="Markdown")
+            else:
+                await context.bot.send_message(chat_id=chat_id, text="⚠️ 该条广告已不存在。")
+            return
+
+        if data == "finish_group":
+            sessions = UPLOADING_SESSIONS[bot_key]
+            session_data = sessions.get(chat_id, {"files": [], "msg_id": None})
+            session_files = session_data["files"]
+
+            if not session_files:
+                await query.message.edit_text("✅ 该组文件已经成功打包过了。")
+                return
+
+            file_count = len(session_files)
+            short_code = generate_unique_short_code(db_file, 8)
+            db_save_resource(db_file, short_code, session_files)
+            sessions[chat_id] = {"files": [], "msg_id": None}
+
+            raw_link = f"https://t.me/{bot_username}?start={short_code}"
+            text = (
+                f"🎉 **归档成功！**\n"
+                f"📦 已确认数量：**{file_count}** 个文件\n"
+                f"🔑 识别码：`{short_code}`\n\n"
+                f"🔗 **提取链接**（点击下方代码即可复制）：\n"
+                f"`{raw_link}`"
+            )
+            keyboard = [
+                [InlineKeyboardButton("🔗 一键提取查看", url=raw_link)],
+                [InlineKeyboardButton("🛠️ 进入管理后台", callback_data="goto_glwj")],
+            ]
+            try:
+                await query.message.edit_text(f"✅ **已确认 {file_count} 个文件并打包入库！**", reply_markup=None)
+            except Exception:
+                pass
+            await query.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+        elif data == "goto_glwj":
+            await show_glwj_panel(query.message, edit=True)
+        elif data.startswith("del_"):
+            code = data.split("_")[1]
+            db_delete_resource(db_file, code)
+            await query.message.edit_text(f"🗑️ 已删除码 `{code}` 的存档。", parse_mode="Markdown")
+        elif data.startswith("view_"):
+            code = data.split("_")[1]
+            file_list = db_get_resource(db_file, code)
+            if file_list:
+                raw_link = f"https://t.me/{bot_username}?start={code}"
+                await query.message.reply_text(f"📌 存档 `{code}`\n总数：{len(file_list)}个\n链接：\n`{raw_link}`", parse_mode="Markdown")
+
+        elif data.startswith("page|"):
+            parts = data.split("|")
+            _, mode, code, page_s, range_start_s, expand_s = parts[:6]
+            show_back = (parts[6] == "1") if len(parts) > 6 else False
+            file_list = db_get_resource(db_file, code)
+            if not file_list:
+                await query.message.reply_text("❌ 存档已失效。")
+                return
+            effective_mode = "all" if bot_key == "manyua" else mode
+            await send_page_with_bar(
+                bot_key, chat_id, context, file_list, code, effective_mode,
+                page_num=int(page_s),
+                range_start=int(range_start_s) or 1,
+                expand_range=(expand_s == "1"),
+                show_back_overview=(show_back and bot_key == "pan"),
+            )
+
+        elif data.startswith("range|"):
+            parts = data.split("|")
+            _, mode, code, cur_page_s, rem_start_s, rem_end_s = parts[:6]
+            show_back = (parts[6] == "1") if len(parts) > 6 else False
+            file_list = db_get_resource(db_file, code)
+            if not file_list:
+                await query.message.edit_text("❌ 存档已失效。")
+                return
+            effective_mode = "all" if bot_key == "manyua" else mode
+            filtered = get_filtered_files(file_list, effective_mode)
+            total_pages = math.ceil(len(filtered) / PAGE_SIZE)
+            markup = build_page_keyboard(
+                bot_key, chat_id, code, effective_mode, total_pages,
+                current_page=int(cur_page_s),
+                range_start=int(rem_start_s),
+                expand_range=True,
+                show_back_overview=(show_back and bot_key == "pan"),
+            )
+            await query.message.edit_reply_markup(reply_markup=markup)
+
+        elif data.startswith("backoverview|") and bot_key == "pan":
+            _, code = data.split("|")
+            file_list = db_get_resource(db_file, code)
+            if not file_list:
+                await query.message.edit_text("❌ 存档已失效。")
+                return
+            overview_text, markup = build_multi_type_selector_payload(code, file_list)
+            await query.message.edit_text(overview_text, reply_markup=markup, parse_mode="Markdown")
+
+    async def glwj_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not can_manage(update.effective_user.id):
+            return
+        await show_glwj_panel(update.message, edit=False)
+
+    async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        if not can_manage(update.effective_user.id):
+            return
+        if os.path.exists(db_file):
+            try:
+                with open(db_file, "rb") as f:
+                    await context.bot.send_document(chat_id=chat_id, document=f, caption="📦 【手动备份】数据库文件。")
+            except Exception as e:
+                await update.message.reply_text(f"❌ 发送数据库失败: {e}")
+        if os.path.exists(ad_file):
+            try:
+                with open(ad_file, "rb") as f:
+                    await context.bot.send_document(chat_id=chat_id, document=f, caption=f"📢 【广告配置】{ad_file}")
+            except Exception as e:
+                await update.message.reply_text(f"❌ 发送广告配置失败: {e}")
+
+    async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        args = context.args
+        chat_id = update.effective_chat.id
+        if args:
+            short_code = args[0]
+            file_list = db_get_resource(db_file, short_code)
+            if file_list:
+                # 提取时直接显示广告和文件
+                await send_ad_to_user(ad_file, chat_id, context, is_preview=False)
+                if bot_key == "manyua":
+                    await deliver_manyua_resource(chat_id, context, short_code, file_list)
+                else:
+                    await deliver_pan_resource(chat_id, context, short_code, file_list)
+            else:
+                await update.message.reply_text("❌ 未找到该存档记录，可能已失效。")
+        else:
+            if bot_key == "manyua":
+                await update.message.reply_text(
+                    "✨ **@Yinheximanyoua_bot 已就绪**\n"
+                    "直接发送图片、视频或 `.zip` 文件，确认数量后即可生成提取链接；超过 10 个文件将自动分页并由你点击页码查看。\n\n"
+                    "• `/setad` - 添加独立广告\n"
+                    "• `/listad` - 查看广告列表\n"
+                    "• `/editad 序号` - 修改广告\n"
+                    "• `/delad [序号]` - 删除广告\n"
+                    "• `/glwj` - 管理存档",
+                    parse_mode="Markdown",
+                )
+            else:
+                await update.message.reply_text(
+                    "🔐 **@Yinhepan_bot 私人云盘就绪**\n"
+                    "直接发送图片、视频或 `.zip` 开始归档。\n\n"
+                    "• `/glwj` - 管理已有存档\n"
+                    "• `/setad` - 添加广告到广告池（随机展示）\n"
+                    "• `/listad` - 查看广告列表与序号\n"
+                    "• `/editad 序号` - 修改指定序号的广告\n"
+                    "• `/delad [序号]` - 删除指定序号广告（不带序号则清空全部）\n"
+                    "• `/backup` - 打包下载数据库与 ad_config.json",
+                    parse_mode="Markdown",
+                )
+
+    return [
+        CommandHandler("start", start_command),
+        CommandHandler("glwj", glwj_command),
+        CommandHandler("backup", backup_command),
+        CommandHandler("setad", setad_command),
+        CommandHandler("listad", listad_command),
+        CommandHandler("editad", editad_command),
+        CommandHandler("cancelad", cancelad_command),
+        CommandHandler("delad", delad_command),
+        MessageHandler(filters.Document.ALL, handle_incoming_document),
+        MessageHandler(filters.PHOTO | filters.VIDEO, handle_incoming_media),
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_incoming_text),
+        CallbackQueryHandler(button_callback),
+    ]
+
+def run_bot_in_thread(token, bot_key, bot_username, db_file, ad_file, require_admin_for_upload):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    app = ApplicationBuilder().token(token).build()
+    for handler in build_bot_handlers(bot_key, bot_username, db_file, ad_file, require_admin_for_upload):
+        app.add_handler(handler)
+    app.run_polling(stop_signals=None)
 
 def main():
-    token = os.environ.get("TOKEN")
-    if not token:
+    pan_token = os.environ.get("TOKEN")
+    manyua_token = os.environ.get("MANYUA_TOKEN")
+
+    if not pan_token and not manyua_token:
         return
-    app = ApplicationBuilder().token(token).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("glwj", glwj_command))
-    app.add_handler(CommandHandler("backup", backup_command))
-    app.add_handler(CommandHandler("setad", setad_command))
-    app.add_handler(CommandHandler("listad", listad_command))
-    app.add_handler(CommandHandler("editad", editad_command))
-    app.add_handler(CommandHandler("cancelad", cancelad_command))
-    app.add_handler(CommandHandler("delad", delad_command))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_incoming_document))
-    app.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_incoming_media))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_incoming_text))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    app.run_polling()
+
+    threads = []
+    if pan_token:
+        t_pan = threading.Thread(
+            target=run_bot_in_thread,
+            args=(pan_token, "pan", PAN_BOT_USERNAME, PAN_DB_FILE, PAN_AD_CONFIG_FILE, True),
+            daemon=True,
+        )
+        t_pan.start()
+        threads.append(t_pan)
+
+    if manyua_token:
+        t_manyua = threading.Thread(
+            target=run_bot_in_thread,
+            args=(manyua_token, "manyua", MANYUA_BOT_USERNAME, MANYUA_DB_FILE, MANYUA_AD_CONFIG_FILE, False),
+            daemon=True,
+        )
+        t_manyua.start()
+        threads.append(t_manyua)
+
+    for t in threads:
+        t.join()
 
 if __name__ == "__main__":
     main()
