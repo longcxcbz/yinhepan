@@ -138,7 +138,6 @@ def normalize_ad_item(item):
                 if b_text and b_url:
                     buttons.append({"text": b_text, "url": b_url})
     else:
-        # 兼容旧单按钮格式 btn_text / btn_url
         b_text = (item.get("btn_text") or "").strip()
         b_url = clean_ad_url(item.get("btn_url") or "")
         if b_text and b_url:
@@ -177,7 +176,6 @@ def load_ad_config():
                 if norm:
                     ads.append(norm)
         else:
-            # 兼容旧单条广告配置结构
             single = normalize_ad_item(data)
             if single:
                 ads.append(single)
@@ -201,6 +199,9 @@ def save_ad_config(config_dict):
 
 load_ad_config()
 
+def get_ads_list():
+    return load_ad_config().get("ads") or []
+
 def add_ad_to_config(media_type="text", photo_id="", video_id="", caption="", buttons=None):
     cfg = load_ad_config()
     new_ad = normalize_ad_item({
@@ -217,6 +218,33 @@ def add_ad_to_config(media_type="text", photo_id="", video_id="", caption="", bu
     save_ad_config({"enabled": True, "ads": ads})
     return new_ad
 
+def update_ad_at_index(idx_zero_based, media_type="text", photo_id="", video_id="", caption="", buttons=None):
+    cfg = load_ad_config()
+    ads = cfg.get("ads") or []
+    if idx_zero_based < 0 or idx_zero_based >= len(ads):
+        return None
+    new_ad = normalize_ad_item({
+        "media_type": media_type or "text",
+        "photo_id": photo_id or "",
+        "video_id": video_id or "",
+        "caption": caption or "",
+        "buttons": buttons or []
+    })
+    if not new_ad:
+        return None
+    ads[idx_zero_based] = new_ad
+    save_ad_config({"enabled": True, "ads": ads})
+    return new_ad
+
+def delete_ad_at_index(idx_zero_based):
+    cfg = load_ad_config()
+    ads = cfg.get("ads") or []
+    if idx_zero_based < 0 or idx_zero_based >= len(ads):
+        return False
+    ads.pop(idx_zero_based)
+    save_ad_config({"enabled": bool(ads), "ads": ads})
+    return True
+
 def pick_random_ad():
     cfg = load_ad_config()
     if not cfg.get("enabled"):
@@ -231,6 +259,7 @@ def db_delete_ad():
 
 UPLOADING_SESSIONS = {}
 WAITING_AD_USERS = set()
+EDITING_AD_INDEX = {}
 
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -414,12 +443,11 @@ def build_overview_payload(short_code, file_list):
     ]
     return overview_text, InlineKeyboardMarkup(keyboard)
 
-# --- 4. 多广告随机展示与多按钮解析 ---
+# --- 4. 多广告展示、管理与多按钮解析 ---
 def build_ad_keyboard(buttons):
     if not buttons:
         return None
     rows = []
-    # 每行最多 2 个按钮，超出自动换行
     for i in range(0, len(buttons), 2):
         row = [
             InlineKeyboardButton(btn["text"], url=btn["url"])
@@ -474,7 +502,6 @@ async def send_ad_to_user(chat_id, context, is_preview=False):
     await send_specific_ad(chat_id, context, ad, is_preview=is_preview)
 
 def _extract_buttons_from_line(line):
-    # 支持同一行用 ； 或 ; 分隔多个 按钮名|链接，也支持单个 按钮名|链接
     parts = [p.strip() for p in re.split(r"[；;]", line) if p.strip()]
     parsed = []
     for part in parts:
@@ -493,7 +520,6 @@ def parse_ad_text(raw_text):
     if not lines:
         return "", []
 
-    # 从末尾向上收集连续的按钮定义行
     collected_buttons = []
     split_idx = len(lines)
     for idx in range(len(lines) - 1, -1, -1):
@@ -508,10 +534,63 @@ def parse_ad_text(raw_text):
     caption = "\n".join(lines[:split_idx]).strip()
     return caption, collected_buttons
 
+def build_ad_list_payload():
+    cfg = load_ad_config()
+    ads = cfg.get("ads") or []
+    if not ads:
+        return "📭 当前广告池为空（0 条广告）。发送 `/setad` 可添加。", None
+
+    lines = [f"📢 **广告池列表**（状态：{'已启用' if cfg.get('enabled') else '已停用'}，共 **{len(ads)}** 条，提取时随机展示）：\n"]
+    keyboard = []
+    for i, ad in enumerate(ads, start=1):
+        mtype_cn = {"photo": "图片", "video": "视频", "text": "纯文本"}.get(ad["media_type"], "文本")
+        preview_txt = (ad.get("caption") or "").replace("\n", " ").strip()
+        if not preview_txt:
+            preview_txt = ad["buttons"][0]["url"] if ad.get("buttons") else "无文案"
+        if len(preview_txt) > 18:
+            preview_txt = preview_txt[:18] + "..."
+        btn_cnt = len(ad.get("buttons") or [])
+        lines.append(f"**#{i}** `[{mtype_cn}]` {preview_txt}（{btn_cnt}按钮）")
+        keyboard.append([
+            InlineKeyboardButton(f"👀 预览 #{i}", callback_data=f"adprev|{i}"),
+            InlineKeyboardButton(f"🗑️ 删除 #{i}", callback_data=f"addel|{i}")
+        ])
+
+    lines.append("\n💡 修改某条请发 `/editad 序号`（如 `/editad 1`）；删除某条可点按钮或发 `/delad 序号`；清空全部发 `/delad`。")
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+async def listad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
+        return
+    text, markup = build_ad_list_payload()
+    await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+
+async def editad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
+        return
+    ads = get_ads_list()
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(f"⚠️ 请指定广告序号，例如 `/editad 1`（当前共 {len(ads)} 条）。", parse_mode="Markdown")
+        return
+    seq = int(context.args[0])
+    if seq < 1 or seq > len(ads):
+        await update.message.reply_text(f"❌ 序号 `{seq}` 不存在，当前有效范围为 `1`～`{len(ads)}`。", parse_mode="Markdown")
+        return
+
+    WAITING_AD_USERS.discard(user_id)
+    EDITING_AD_INDEX[user_id] = seq - 1
+    await update.message.reply_text(
+        f"✏️ **正在修改第 #{seq} 条广告**\n请发送新的纯文本、带说明的图片或视频（末尾可附带按钮），将直接替换第 #{seq} 条。\n发送 `/cancelad` 可取消。",
+        parse_mode="Markdown"
+    )
+
 async def setad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
         return
+    EDITING_AD_INDEX.pop(user_id, None)
     WAITING_AD_USERS.add(user_id)
     guide_text = (
         "📢 **进入广告添加模式（支持多广告随机 + 多按钮）**\n\n"
@@ -521,21 +600,37 @@ async def setad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "主频道|[https://t.me/jisogd](https://t.me/jisogd)；备用群|[https://t.me/your_group](https://t.me/your_group)\n"
         "```\n"
         "💡 **说明**：\n"
-        "• 每次设置会添加到 `ad_config.json` 广告池，用户提取文件时随机展示其中一条。\n"
-        "• 发送 `/cancelad` 取消本次设置；发送 `/delad` 清空全部广告。"
+        "• 每次添加会自动分配序号（`#1`, `#2`...）并写入 `ad_config.json`。\n"
+        "• 发送 `/listad` 查看序号、`/editad 序号` 修改单条、`/delad 序号` 删除单条、`/delad` 清空全部、`/cancelad` 取消。"
     )
     await update.message.reply_text(guide_text, parse_mode="Markdown")
 
 async def cancelad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id in WAITING_AD_USERS:
-        WAITING_AD_USERS.remove(user_id)
-        await update.message.reply_text("❎ 已退出广告设置模式。")
+    was_waiting = user_id in WAITING_AD_USERS
+    was_editing = user_id in EDITING_AD_INDEX
+    WAITING_AD_USERS.discard(user_id)
+    EDITING_AD_INDEX.pop(user_id, None)
+    if was_waiting or was_editing:
+        await update.message.reply_text("❎ 已退出广告设置/修改模式。")
 
 async def delad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
         return
+    ads = get_ads_list()
+    if context.args:
+        if not context.args[0].isdigit():
+            await update.message.reply_text("⚠️ 序号须为数字，例如 `/delad 2`；不带数字 `/delad` 则清空全部广告。", parse_mode="Markdown")
+            return
+        seq = int(context.args[0])
+        if seq < 1 or seq > len(ads):
+            await update.message.reply_text(f"❌ 序号 `{seq}` 不存在，当前有效范围为 `1`～`{len(ads)}`。", parse_mode="Markdown")
+            return
+        if delete_ad_at_index(seq - 1):
+            await update.message.reply_text(f"🗑️ 已删除第 **#{seq}** 条广告并更新 `ad_config.json`。", parse_mode="Markdown")
+        return
+
     db_delete_ad()
     await update.message.reply_text("🗑️ 已清空 `ad_config.json` 中的全部广告。")
 
@@ -544,12 +639,23 @@ async def handle_incoming_text(update: Update, context: ContextTypes.DEFAULT_TYP
     if not message or not message.text:
         return
     user_id = message.from_user.id
+    if user_id in EDITING_AD_INDEX:
+        idx = EDITING_AD_INDEX.pop(user_id)
+        caption, buttons = parse_ad_text(message.text)
+        saved_ad = update_ad_at_index(idx, media_type="text", caption=caption, buttons=buttons)
+        if saved_ad:
+            await message.reply_text(f"✅ **已更新第 #{idx + 1} 条广告（纯文本）！** 预览如下：")
+            await send_specific_ad(message.chat_id, context, saved_ad, is_preview=True)
+        else:
+            await message.reply_text("❌ 更新失败：广告内容为空或序号已失效。")
+        return
+
     if user_id in WAITING_AD_USERS:
         WAITING_AD_USERS.remove(user_id)
         caption, buttons = parse_ad_text(message.text)
         saved_ad = add_ad_to_config(media_type="text", caption=caption, buttons=buttons)
-        total_ads = len(load_ad_config().get("ads", []))
-        await message.reply_text(f"✅ **纯文本广告已加入广告池（当前共 {total_ads} 条，随机展示）！** 预览如下：")
+        total_ads = len(get_ads_list())
+        await message.reply_text(f"✅ **纯文本广告已加入广告池（编号 #{total_ads}，共 {total_ads} 条）！** 预览如下：")
         await send_specific_ad(message.chat_id, context, saved_ad, is_preview=True)
 
 async def handle_incoming_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -581,6 +687,22 @@ async def handle_incoming_media(update: Update, context: ContextTypes.DEFAULT_TY
     if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
         return
 
+    if user_id in EDITING_AD_INDEX and (message.photo or message.video):
+        idx = EDITING_AD_INDEX.pop(user_id)
+        caption, buttons = parse_ad_text(message.caption or "")
+        if message.video:
+            saved_ad = update_ad_at_index(idx, media_type="video", video_id=message.video.file_id, caption=caption, buttons=buttons)
+            label = "视频广告"
+        else:
+            saved_ad = update_ad_at_index(idx, media_type="photo", photo_id=message.photo[-1].file_id, caption=caption, buttons=buttons)
+            label = "图文广告"
+        if saved_ad:
+            await message.reply_text(f"✅ **已更新第 #{idx + 1} 条广告（{label}）！** 预览如下：")
+            await send_specific_ad(chat_id, context, saved_ad, is_preview=True)
+        else:
+            await message.reply_text("❌ 更新失败：序号已失效。")
+        return
+
     if user_id in WAITING_AD_USERS and (message.photo or message.video):
         WAITING_AD_USERS.remove(user_id)
         caption, buttons = parse_ad_text(message.caption or "")
@@ -592,8 +714,8 @@ async def handle_incoming_media(update: Update, context: ContextTypes.DEFAULT_TY
             photo_id = message.photo[-1].file_id
             saved_ad = add_ad_to_config(media_type="photo", photo_id=photo_id, caption=caption, buttons=buttons)
             label = "图文广告"
-        total_ads = len(load_ad_config().get("ads", []))
-        await message.reply_text(f"✅ **{label}已加入广告池（当前共 {total_ads} 条，随机展示）！** 预览如下：")
+        total_ads = len(get_ads_list())
+        await message.reply_text(f"✅ **{label}已加入广告池（编号 #{total_ads}，共 {total_ads} 条）！** 预览如下：")
         await send_specific_ad(chat_id, context, saved_ad, is_preview=True)
         return
 
@@ -669,7 +791,34 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     chat_id = query.message.chat_id
+    user_id = query.from_user.id
     data = query.data
+
+    if data.startswith("adprev|"):
+        if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
+            return
+        seq = int(data.split("|")[1])
+        ads = get_ads_list()
+        if 1 <= seq <= len(ads):
+            await context.bot.send_message(chat_id=chat_id, text=f"👀 **预览第 #{seq} 条广告：**", parse_mode="Markdown")
+            await send_specific_ad(chat_id, context, ads[seq - 1], is_preview=True)
+        else:
+            await context.bot.send_message(chat_id=chat_id, text="⚠️ 该条广告已不存在。")
+        return
+
+    if data.startswith("addel|"):
+        if ADMIN_USER_ID != 0 and user_id != ADMIN_USER_ID:
+            return
+        seq = int(data.split("|")[1])
+        if delete_ad_at_index(seq - 1):
+            text, markup = build_ad_list_payload()
+            if markup:
+                await query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+            else:
+                await query.message.edit_text(text, parse_mode="Markdown")
+        else:
+            await context.bot.send_message(chat_id=chat_id, text="⚠️ 该条广告已不存在。")
+        return
 
     if data == "finish_group":
         session_data = UPLOADING_SESSIONS.get(chat_id, {"files": [], "msg_id": None})
@@ -807,8 +956,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🔐 私人云盘就绪。直接发送图片或视频开始归档。\n\n"
             "• `/glwj` - 管理已有存档\n"
-            "• `/setad` - 添加广告到广告池（支持文本/图片/视频 + 多按钮，随机展示）\n"
-            "• `/delad` - 清空全部广告\n"
+            "• `/setad` - 添加广告到广告池（随机展示）\n"
+            "• `/listad` - 查看广告列表与序号\n"
+            "• `/editad 序号` - 修改指定序号的广告\n"
+            "• `/delad [序号]` - 删除指定序号广告（不带序号则清空全部）\n"
             "• `/backup` - 打包下载数据库与 ad_config.json"
         )
 
@@ -821,6 +972,8 @@ def main():
     app.add_handler(CommandHandler("glwj", glwj_command))
     app.add_handler(CommandHandler("backup", backup_command))
     app.add_handler(CommandHandler("setad", setad_command))
+    app.add_handler(CommandHandler("listad", listad_command))
+    app.add_handler(CommandHandler("editad", editad_command))
     app.add_handler(CommandHandler("cancelad", cancelad_command))
     app.add_handler(CommandHandler("delad", delad_command))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_incoming_document))
