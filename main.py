@@ -31,8 +31,8 @@ BOT_USERNAME = "Yinhepan_bot"
 
 # 填写允许上传归档及执行管理命令的 Telegram 数字 ID（可填多个，用逗号分隔；留空 set() 则不限制）
 ADMIN_USER_IDS = {
-    # 123456789,
-    # 987654321,
+    8790114086,
+    970905815,
 }
 
 def is_admin(user_id: int) -> bool:
