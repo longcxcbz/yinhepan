@@ -1,3 +1,4 @@
+import json
 import logging
 import math
 import os
@@ -5,15 +6,15 @@ import random
 import re
 import secrets
 import sqlite3
-import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import (
-    InlineKeyboardButton, 
-    InlineKeyboardMarkup, 
-    InputMediaPhoto, 
-    InputMediaVideo, 
-    Update
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaDocument,
+    InputMediaPhoto,
+    InputMediaVideo,
+    Update,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -30,8 +31,8 @@ BOT_USERNAME = "Yinhepan_bot"
 
 # 填写允许上传归档及执行管理命令的 Telegram 数字 ID（可填多个，用逗号分隔；留空 set() 则不限制）
 ADMIN_USER_IDS = {
-    8790114086,
-    970905815,
+    # 123456789,
+    # 987654321,
 }
 
 def is_admin(user_id: int) -> bool:
@@ -42,12 +43,12 @@ def is_admin(user_id: int) -> bool:
 DB_FILE = "private_database.db"
 AD_CONFIG_FILE = "ad_config.json"
 
-PAGE_SIZE = 10          # 每页 10 个文件（20 张图分 2 页，80 个分 8 页）
+PAGE_SIZE = 10          # 每页 10 个文件；总数 <= 10 直接全部下发，> 10 才分页/按需筛选
 MAX_VISIBLE_PAGES = 5   # 首批平铺显示的页码数量，超出折叠为 "6-8" 范围按钮
 
 DEFAULT_AD_CONFIG = {
     "enabled": False,
-    "ads": []
+    "ads": [],
 }
 
 # 记录每个用户对 (short_code, mode) 已获取过的页码集合：{(chat_id, short_code, mode): {1, 2}}
@@ -166,7 +167,7 @@ def normalize_ad_item(item):
         "photo_id": photo_id,
         "video_id": video_id,
         "caption": caption,
-        "buttons": buttons
+        "buttons": buttons,
     }
 
 def load_ad_config():
@@ -220,7 +221,7 @@ def add_ad_to_config(media_type="text", photo_id="", video_id="", caption="", bu
         "photo_id": photo_id or "",
         "video_id": video_id or "",
         "caption": caption or "",
-        "buttons": buttons or []
+        "buttons": buttons or [],
     })
     if not new_ad:
         return None
@@ -239,7 +240,7 @@ def update_ad_at_index(idx_zero_based, media_type="text", photo_id="", video_id=
         "photo_id": photo_id or "",
         "video_id": video_id or "",
         "caption": caption or "",
-        "buttons": buttons or []
+        "buttons": buttons or [],
     })
     if not new_ad:
         return None
@@ -287,16 +288,34 @@ def run_web_server():
 
 threading.Thread(target=run_web_server, daemon=True).start()
 
-# --- 3. 分页状态与页码按钮构建 ---
+# --- 3. 格式识别、智能分流与分页逻辑 ---
+def is_zip_document(document):
+    if not document:
+        return False
+    fname = (document.file_name or "").lower()
+    mime = (document.mime_type or "").lower()
+    return fname.endswith(".zip") or mime in {"application/zip", "application/x-zip-compressed"}
+
+def get_present_types(file_list):
+    # 按固定顺序返回实际存在的格式类型：photo, video, zip
+    present = []
+    for t in ("photo", "video", "zip"):
+        if any(x.get("type") == t for x in file_list):
+            present.append(t)
+    return present
+
 def get_filtered_files(file_list, mode):
-    if mode == "photo":
-        return [x for x in file_list if x["type"] == "photo"]
-    elif mode == "video":
-        return [x for x in file_list if x["type"] == "video"]
+    if mode in ("photo", "video", "zip"):
+        return [x for x in file_list if x.get("type") == mode]
     return file_list
 
 def get_mode_label(mode):
-    return {"all": "全部文件", "photo": "仅看图片", "video": "仅看视频"}.get(mode, "全部文件")
+    return {
+        "all": "全部文件",
+        "photo": "图片",
+        "video": "视频",
+        "zip": "压缩包",
+    }.get(mode, "全部文件")
 
 def mark_page_fetched(chat_id, short_code, mode, page_num):
     key = (chat_id, short_code, mode)
@@ -314,7 +333,7 @@ def format_page_label(page_num, current_page, fetched_set):
         return f"✅{page_num}"
     return f"{page_num}"
 
-def build_page_keyboard(chat_id, short_code, mode, total_pages, current_page, range_start=1, expand_range=False):
+def build_page_keyboard(chat_id, short_code, mode, total_pages, current_page, range_start=1, expand_range=False, show_back_overview=True):
     fetched_set = get_fetched_set(chat_id, short_code, mode)
     keyboard = []
 
@@ -322,7 +341,7 @@ def build_page_keyboard(chat_id, short_code, mode, total_pages, current_page, ra
         row = [
             InlineKeyboardButton(
                 format_page_label(p, current_page, fetched_set),
-                callback_data=f"page|{mode}|{short_code}|{p}|0|0"
+                callback_data=f"page|{mode}|{short_code}|{p}|0|0|{'1' if show_back_overview else '0'}"
             )
             for p in range(1, total_pages + 1)
         ]
@@ -332,7 +351,7 @@ def build_page_keyboard(chat_id, short_code, mode, total_pages, current_page, ra
             first_row = [
                 InlineKeyboardButton(
                     format_page_label(p, current_page, fetched_set),
-                    callback_data=f"page|{mode}|{short_code}|{p}|0|0"
+                    callback_data=f"page|{mode}|{short_code}|{p}|0|0|{'1' if show_back_overview else '0'}"
                 )
                 for p in range(1, MAX_VISIBLE_PAGES + 1)
             ]
@@ -353,7 +372,7 @@ def build_page_keyboard(chat_id, short_code, mode, total_pages, current_page, ra
                 range_row.append(
                     InlineKeyboardButton(
                         label,
-                        callback_data=f"range|{mode}|{short_code}|{current_page}|{rem_start}|{rem_end}"
+                        callback_data=f"range|{mode}|{short_code}|{current_page}|{rem_start}|{rem_end}|{'1' if show_back_overview else '0'}"
                     )
                 )
                 rem_start = rem_end + 1
@@ -362,7 +381,7 @@ def build_page_keyboard(chat_id, short_code, mode, total_pages, current_page, ra
             expanded_row = [
                 InlineKeyboardButton(
                     format_page_label(p, current_page, fetched_set),
-                    callback_data=f"page|{mode}|{short_code}|{p}|{range_start}|1"
+                    callback_data=f"page|{mode}|{short_code}|{p}|{range_start}|1|{'1' if show_back_overview else '0'}"
                 )
                 for p in range(range_start, min(range_start + MAX_VISIBLE_PAGES, total_pages + 1))
             ]
@@ -370,16 +389,43 @@ def build_page_keyboard(chat_id, short_code, mode, total_pages, current_page, ra
             keyboard.append([
                 InlineKeyboardButton(
                     "↩️ 返回 1-5 页码",
-                    callback_data=f"page|{mode}|{short_code}|{current_page}|1|0"
+                    callback_data=f"page|{mode}|{short_code}|{current_page}|1|0|{'1' if show_back_overview else '0'}"
                 )
             ])
 
-    keyboard.append([
-        InlineKeyboardButton("⬅️ 返回存档概览", callback_data=f"backoverview|{short_code}")
-    ])
+    if show_back_overview:
+        keyboard.append([
+            InlineKeyboardButton("⬅️ 返回格式选择", callback_data=f"backoverview|{short_code}")
+        ])
     return InlineKeyboardMarkup(keyboard)
 
-async def send_page_with_bar(chat_id, context, file_list, short_code, mode, page_num, range_start=1, expand_range=False):
+async def send_items_batch(chat_id, context, items):
+    # photo/video 走媒体组；zip 逐个发送文档（或 photo/video 混发）
+    media_group = []
+    zip_items = []
+
+    for x in items:
+        if x.get("type") in ("photo", "video"):
+            media_group.append(x)
+        else:
+            zip_items.append(x)
+
+    if media_group:
+        tg_media = [
+            InputMediaPhoto(media=x["file_id"]) if x["type"] == "photo"
+            else InputMediaVideo(media=x["file_id"])
+            for x in media_group
+        ]
+        await context.bot.send_media_group(chat_id=chat_id, media=tg_media)
+
+    for z in zip_items:
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=z["file_id"],
+            filename=z.get("file_name") or None,
+        )
+
+async def send_page_with_bar(chat_id, context, file_list, short_code, mode, page_num, range_start=1, expand_range=False, show_back_overview=True):
     filtered = get_filtered_files(file_list, mode)
     total_items = len(filtered)
     if total_items == 0:
@@ -397,15 +443,13 @@ async def send_page_with_bar(chat_id, context, file_list, short_code, mode, page
     end_idx = min(start_idx + PAGE_SIZE, total_items)
     chunk = filtered[start_idx:end_idx]
 
-    media = [
-        InputMediaPhoto(media=x["file_id"]) if x["type"] == "photo" 
-        else InputMediaVideo(media=x["file_id"]) 
-        for x in chunk
-    ]
     try:
-        await context.bot.send_media_group(chat_id=chat_id, media=media)
+        await send_items_batch(chat_id, context, chunk)
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"❌ 下发出错: {e}")
+        return
+
+    if total_pages <= 1 and not show_back_overview:
         return
 
     fetched_set = get_fetched_set(chat_id, short_code, mode)
@@ -419,14 +463,16 @@ async def send_page_with_bar(chat_id, context, file_list, short_code, mode, page
         chat_id, short_code, mode, total_pages,
         current_page=page_num,
         range_start=range_start,
-        expand_range=expand_range
+        expand_range=expand_range,
+        show_back_overview=show_back_overview,
     )
     await context.bot.send_message(chat_id=chat_id, text=bar_text, reply_markup=markup, parse_mode="Markdown")
 
-def build_overview_payload(short_code, file_list):
+def build_multi_type_selector_payload(short_code, file_list):
     total_count = len(file_list)
-    photo_count = sum(1 for x in file_list if x["type"] == "photo")
-    video_count = sum(1 for x in file_list if x["type"] == "video")
+    photo_count = sum(1 for x in file_list if x.get("type") == "photo")
+    video_count = sum(1 for x in file_list if x.get("type") == "video")
+    zip_count = sum(1 for x in file_list if x.get("type") == "zip")
     total_pages = math.ceil(total_count / PAGE_SIZE)
 
     total_bytes = sum(x.get("size", 0) for x in file_list)
@@ -435,24 +481,70 @@ def build_overview_payload(short_code, file_list):
     else:
         size_str = f"{total_bytes / (1024 * 1024):.2f} MB"
 
+    breakdown_lines = []
+    if photo_count:
+        breakdown_lines.append(f"🖼️ 图片：**{photo_count}** 个")
+    if video_count:
+        breakdown_lines.append(f"🎬 视频：**{video_count}** 个")
+    if zip_count:
+        breakdown_lines.append(f"🗜️ 压缩包：**{zip_count}** 个")
+
     overview_text = (
-        f"📊 **私密存档概览**\n\n"
+        f"📊 **存档包含多种格式（共 {total_count} 个）**\n\n"
         f"🔑 识别码：`{short_code}`\n"
-        f"🖼️ 图片数量：**{photo_count}** 个\n"
-        f"🎬 视频数量：**{video_count}** 个\n"
-        f"📦 总文件数：**{total_count}** 个（全部共 **{total_pages}** 页，每页 {PAGE_SIZE} 个）\n"
+        + "\n".join(breakdown_lines) + "\n"
         f"💾 估计总容量：**{size_str}**\n\n"
-        f"👇 **点击下方按钮直接获取第 1 页内容：**"
+        f"👇 **请选择要查看的格式（直接下发第 1 页）：**"
     )
 
     keyboard = [
-        [InlineKeyboardButton(f"📑 全部第 1 页 ({total_count}个 / {total_pages}页)", callback_data=f"page|all|{short_code}|1|0|0")],
-        [
-            InlineKeyboardButton(f"🖼️ 图片第 1 页 ({photo_count}个)", callback_data=f"page|photo|{short_code}|1|0|0"),
-            InlineKeyboardButton(f"🎬 视频第 1 页 ({video_count}个)", callback_data=f"page|video|{short_code}|1|0|0")
-        ]
+        [InlineKeyboardButton(f"📑 全部第 1 页 ({total_count}个 / {total_pages}页)", callback_data=f"page|all|{short_code}|1|0|0|1")]
     ]
+    type_buttons = []
+    if photo_count:
+        type_buttons.append(InlineKeyboardButton(f"🖼️ 图片 ({photo_count})", callback_data=f"page|photo|{short_code}|1|0|0|1"))
+    if video_count:
+        type_buttons.append(InlineKeyboardButton(f"🎬 视频 ({video_count})", callback_data=f"page|video|{short_code}|1|0|0|1"))
+    if zip_count:
+        type_buttons.append(InlineKeyboardButton(f"🗜️ 压缩包 ({zip_count})", callback_data=f"page|zip|{short_code}|1|0|0|1"))
+
+    for i in range(0, len(type_buttons), 2):
+        keyboard.append(type_buttons[i:i + 2])
+
     return overview_text, InlineKeyboardMarkup(keyboard)
+
+async def deliver_resource_smart(chat_id, context, short_code, file_list):
+    """
+    智能分流规则：
+    1. 文件总数 <= 10 个：直接全部下发，无需选择。
+    2. 文件总数 > 10 个，且只有 1 种格式：跳过格式选择，直接下发该格式第 1 页（附带页码条）。
+    3. 文件总数 > 10 个，且有 >= 2 种格式：展示格式选择按钮。
+    """
+    total_count = len(file_list)
+    if total_count == 0:
+        await context.bot.send_message(chat_id=chat_id, text="📂 该存档为空。")
+        return
+
+    if total_count <= PAGE_SIZE:
+        try:
+            await send_items_batch(chat_id, context, file_list)
+        except Exception as e:
+            await context.bot.send_message(chat_id=chat_id, text=f"❌ 下发出错: {e}")
+        return
+
+    present_types = get_present_types(file_list)
+    if len(present_types) == 1:
+        single_mode = present_types[0]
+        await send_page_with_bar(
+            chat_id, context, file_list, short_code,
+            mode=single_mode, page_num=1,
+            range_start=1, expand_range=False,
+            show_back_overview=False
+        )
+        return
+
+    overview_text, markup = build_multi_type_selector_payload(short_code, file_list)
+    await context.bot.send_message(chat_id=chat_id, text=overview_text, reply_markup=markup, parse_mode="Markdown")
 
 # --- 4. 多广告展示、管理与多按钮解析 ---
 def build_ad_keyboard(buttons):
@@ -481,14 +573,14 @@ async def send_specific_ad(chat_id, context, ad, is_preview=False):
                 chat_id=chat_id,
                 video=ad["video_id"],
                 caption=ad.get("caption") or None,
-                reply_markup=reply_markup
+                reply_markup=reply_markup,
             )
         elif mtype == "photo" and ad.get("photo_id"):
             await context.bot.send_photo(
                 chat_id=chat_id,
                 photo=ad["photo_id"],
                 caption=ad.get("caption") or None,
-                reply_markup=reply_markup
+                reply_markup=reply_markup,
             )
         else:
             text_to_send = ad.get("caption") or (ad["buttons"][0]["url"] if ad.get("buttons") else "")
@@ -497,7 +589,7 @@ async def send_specific_ad(chat_id, context, ad, is_preview=False):
                     chat_id=chat_id,
                     text=text_to_send,
                     reply_markup=reply_markup,
-                    disable_web_page_preview=False
+                    disable_web_page_preview=False,
                 )
     except Exception as e:
         logging.error(f"发送广告失败: {e}")
@@ -505,7 +597,7 @@ async def send_specific_ad(chat_id, context, ad, is_preview=False):
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=f"❌ **广告预览发送失败**\n原因：`{e}`\n请检查各按钮链接是否为有效网址。",
-                parse_mode="Markdown"
+                parse_mode="Markdown",
             )
 
 async def send_ad_to_user(chat_id, context, is_preview=False):
@@ -564,7 +656,7 @@ def build_ad_list_payload():
         lines.append(f"**#{i}** `[{mtype_cn}]` {preview_txt}（{btn_cnt}按钮）")
         keyboard.append([
             InlineKeyboardButton(f"👀 预览 #{i}", callback_data=f"adprev|{i}"),
-            InlineKeyboardButton(f"🗑️ 删除 #{i}", callback_data=f"addel|{i}")
+            InlineKeyboardButton(f"🗑️ 删除 #{i}", callback_data=f"addel|{i}"),
         ])
 
     lines.append("\n💡 修改某条请发 `/editad 序号`（如 `/editad 1`）；删除某条可点按钮或发 `/delad 序号`；清空全部发 `/delad`。")
@@ -593,7 +685,7 @@ async def editad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     EDITING_AD_INDEX[user_id] = seq - 1
     await update.message.reply_text(
         f"✏️ **正在修改第 #{seq} 条广告**\n请发送新的纯文本、带说明的图片或视频（末尾可附带按钮），将直接替换第 #{seq} 条。\n发送 `/cancelad` 可取消。",
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
 
 async def setad_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -672,19 +764,65 @@ async def handle_incoming_document(update: Update, context: ContextTypes.DEFAULT
     if not message or not message.document:
         return
     document = message.document
+    chat_id = message.chat_id
+    user_id = message.from_user.id
+
     if document.file_name and document.file_name.endswith(".db"):
+        if not is_admin(user_id):
+            return
         file = await context.bot.get_file(document.file_id)
         await file.download_to_drive(DB_FILE)
         init_db()
         await message.reply_text("✅ **数据库恢复成功！**\n已成功加载您上传的数据库文件，所有历史存档已恢复在线。")
-    elif document.file_name == AD_CONFIG_FILE:
+        return
+
+    if document.file_name == AD_CONFIG_FILE:
+        if not is_admin(user_id):
+            return
         file = await context.bot.get_file(document.file_id)
         await file.download_to_drive(AD_CONFIG_FILE)
         cfg = load_ad_config()
         await message.reply_text(f"✅ **广告配置文件 `ad_config.json` 已加载生效（共 {len(cfg.get('ads', []))} 条广告）！** 随机预览如下：")
-        await send_ad_to_user(message.chat_id, context, is_preview=True)
-    else:
-        await message.reply_text("📂 收到您的文件，但该文件不是 `.db` 数据库或 `ad_config.json` 配置文件。")
+        await send_ad_to_user(chat_id, context, is_preview=True)
+        return
+
+    if is_zip_document(document):
+        if not is_admin(user_id):
+            return
+        if chat_id not in UPLOADING_SESSIONS:
+            UPLOADING_SESSIONS[chat_id] = {"files": [], "msg_id": None}
+
+        UPLOADING_SESSIONS[chat_id]["files"].append({
+            "type": "zip",
+            "file_id": document.file_id,
+            "file_name": document.file_name or "archive.zip",
+            "size": document.file_size or 0,
+        })
+        total_count = len(UPLOADING_SESSIONS[chat_id]["files"])
+        text = f"📥 **正在归档...**\n已暂存：**{total_count}** 个文件"
+        keyboard = [[InlineKeyboardButton("✅ 归档完毕，生成永久存档", callback_data="finish_group")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        current_msg_id = UPLOADING_SESSIONS[chat_id]["msg_id"]
+        try:
+            if current_msg_id is None:
+                sent_msg = await message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+                UPLOADING_SESSIONS[chat_id]["msg_id"] = sent_msg.message_id
+            else:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=current_msg_id,
+                    text=text,
+                    reply_markup=reply_markup,
+                    parse_mode="Markdown",
+                )
+        except Exception:
+            sent_msg = await message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+            UPLOADING_SESSIONS[chat_id]["msg_id"] = sent_msg.message_id
+        return
+
+    if is_admin(user_id):
+        await message.reply_text("📂 仅支持归档图片、视频与 `.zip` 压缩包（或上传 `.db` / `ad_config.json` 恢复）。")
 
 async def handle_incoming_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -744,9 +882,9 @@ async def handle_incoming_media(update: Update, context: ContextTypes.DEFAULT_TY
         UPLOADING_SESSIONS[chat_id] = {"files": [], "msg_id": None}
 
     UPLOADING_SESSIONS[chat_id]["files"].append({
-        "type": file_type, 
+        "type": file_type,
         "file_id": file_id,
-        "size": file_size
+        "size": file_size,
     })
     total_count = len(UPLOADING_SESSIONS[chat_id]["files"])
 
@@ -761,11 +899,11 @@ async def handle_incoming_media(update: Update, context: ContextTypes.DEFAULT_TY
             UPLOADING_SESSIONS[chat_id]["msg_id"] = sent_msg.message_id
         else:
             await context.bot.edit_message_text(
-                chat_id=chat_id, 
-                message_id=current_msg_id, 
-                text=text, 
-                reply_markup=reply_markup, 
-                parse_mode="Markdown"
+                chat_id=chat_id,
+                message_id=current_msg_id,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode="Markdown",
             )
     except Exception:
         sent_msg = await message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
@@ -784,13 +922,13 @@ async def show_glwj_panel(message_obj, edit=False):
     text = f"🛠️ **存档复查后台**\n共找到 {len(resources)} 组存档："
     keyboard = [
         [
-            InlineKeyboardButton(f"📁 码:{i['short_code']} ({i['count']}个)", callback_data=f"view_{i['short_code']}"), 
-            InlineKeyboardButton("❌ 删除", callback_data=f"del_{i['short_code']}")
-        ] 
+            InlineKeyboardButton(f"📁 码:{i['short_code']} ({i['count']}个)", callback_data=f"view_{i['short_code']}"),
+            InlineKeyboardButton("❌ 删除", callback_data=f"del_{i['short_code']}"),
+        ]
         for i in resources
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
+
     if edit:
         await message_obj.edit_text(text, reply_markup=reply_markup, parse_mode="Markdown")
     else:
@@ -848,12 +986,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔗 **提取链接**（点击下方代码即可复制）：\n"
             f"`{raw_link}`"
         )
-        
+
         keyboard = [
             [InlineKeyboardButton("🔗 一键提取查看", url=raw_link)],
-            [InlineKeyboardButton("🛠️ 进入管理后台", callback_data="goto_glwj")]
+            [InlineKeyboardButton("🛠️ 进入管理后台", callback_data="goto_glwj")],
         ]
-        
+
         try:
             await query.message.edit_text("✅ **本组文件已打包入库完成！**", reply_markup=None)
         except Exception:
@@ -875,7 +1013,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"📌 存档 `{code}`\n总数：{len(file_list)}个\n链接：\n`{raw_link}`", parse_mode="Markdown")
 
     elif data.startswith("page|"):
-        _, mode, code, page_s, range_start_s, expand_s = data.split("|")
+        parts = data.split("|")
+        _, mode, code, page_s, range_start_s, expand_s = parts[:6]
+        show_back = (parts[6] == "1") if len(parts) > 6 else True
         file_list = db_get_resource(code)
         if not file_list:
             await query.message.reply_text("❌ 存档已失效。")
@@ -884,25 +1024,26 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id, context, file_list, code, mode,
             page_num=int(page_s),
             range_start=int(range_start_s) or 1,
-            expand_range=(expand_s == "1")
+            expand_range=(expand_s == "1"),
+            show_back_overview=show_back,
         )
 
     elif data.startswith("range|"):
-        _, mode, code, cur_page_s, rem_start_s, rem_end_s = data.split("|")
+        parts = data.split("|")
+        _, mode, code, cur_page_s, rem_start_s, rem_end_s = parts[:6]
+        show_back = (parts[6] == "1") if len(parts) > 6 else True
         file_list = db_get_resource(code)
         if not file_list:
             await query.message.edit_text("❌ 存档已失效。")
             return
         filtered = get_filtered_files(file_list, mode)
         total_pages = math.ceil(len(filtered) / PAGE_SIZE)
-        cur_page = int(cur_page_s)
-        rem_start = int(rem_start_s)
-        rem_end = int(rem_end_s)
         markup = build_page_keyboard(
             chat_id, code, mode, total_pages,
-            current_page=cur_page,
-            range_start=rem_start,
-            expand_range=True
+            current_page=int(cur_page_s),
+            range_start=int(rem_start_s),
+            expand_range=True,
+            show_back_overview=show_back,
         )
         await query.message.edit_reply_markup(reply_markup=markup)
 
@@ -912,7 +1053,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not file_list:
             await query.message.edit_text("❌ 存档已失效。")
             return
-        overview_text, markup = build_overview_payload(code, file_list)
+        overview_text, markup = build_multi_type_selector_payload(code, file_list)
         await query.message.edit_text(overview_text, reply_markup=markup, parse_mode="Markdown")
 
 async def glwj_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -924,14 +1065,14 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     if not is_admin(update.effective_user.id):
         return
-    
+
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, "rb") as f:
                 await context.bot.send_document(
-                    chat_id=chat_id, 
-                    document=f, 
-                    caption="📦 【手动备份】这是您当前的数据库文件。"
+                    chat_id=chat_id,
+                    document=f,
+                    caption="📦 【手动备份】这是您当前的数据库文件。",
                 )
         except Exception as e:
             await update.message.reply_text(f"❌ 发送备份文件失败: {e}")
@@ -944,7 +1085,7 @@ async def backup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_document(
                     chat_id=chat_id,
                     document=f,
-                    caption="📢 【广告配置】这是您当前的 ad_config.json 多广告配置文件。"
+                    caption="📢 【广告配置】这是您当前的 ad_config.json 多广告配置文件。",
                 )
         except Exception as e:
             await update.message.reply_text(f"❌ 发送广告配置文件失败: {e}")
@@ -956,14 +1097,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         short_code = args[0]
         file_list = db_get_resource(short_code)
         if file_list:
-            overview_text, reply_markup = build_overview_payload(short_code, file_list)
-            await update.message.reply_text(overview_text, reply_markup=reply_markup, parse_mode="Markdown")
+            await deliver_resource_smart(chat_id, context, short_code, file_list)
             await send_ad_to_user(chat_id, context, is_preview=False)
         else:
             await update.message.reply_text("❌ 未找到该存档记录，可能已失效。")
     else:
         await update.message.reply_text(
-            "🔐 私人云盘就绪。直接发送图片或视频开始归档。\n\n"
+            "🔐 私人云盘就绪。直接发送图片、视频或 `.zip` 压缩包开始归档。\n\n"
             "• `/glwj` - 管理已有存档\n"
             "• `/setad` - 添加广告到广告池（随机展示）\n"
             "• `/listad` - 查看广告列表与序号\n"
