@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+import secrets
 import sqlite3
 import json
 import threading
@@ -28,7 +29,7 @@ ADMIN_USER_ID = 0
 DB_FILE = "private_database.db"
 AD_CONFIG_FILE = "ad_config.json"
 
-PAGE_SIZE = 10          # 每页 10 个文件（20 张图自动分 2 页，80 个分 8 页）
+PAGE_SIZE = 10          # 每页 10 个文件（20 张图分 2 页，80 个分 8 页）
 MAX_VISIBLE_PAGES = 5   # 首批平铺显示的页码数量，超出折叠为 "6-8" 范围按钮
 
 DEFAULT_AD_CONFIG = {
@@ -58,10 +59,25 @@ def init_db():
 
 init_db()
 
+def db_code_exists(short_code):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM resources WHERE short_code = ? LIMIT 1", (short_code,))
+    exists = cursor.fetchone() is not None
+    conn.close()
+    return exists
+
+def generate_unique_short_code(length=8):
+    # 循环生成随机码并查库判重，确保绝对不重复、不覆盖已有存档
+    while True:
+        code = secrets.token_hex((length + 1) // 2)[:length]
+        if not db_code_exists(code):
+            return code
+
 def db_save_resource(short_code, file_list):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    cursor.execute("INSERT OR REPLACE INTO resources (short_code, file_list) VALUES (?, ?)", (short_code, json.dumps(file_list)))
+    cursor.execute("INSERT INTO resources (short_code, file_list) VALUES (?, ?)", (short_code, json.dumps(file_list)))
     conn.commit()
     conn.close()
 
@@ -333,15 +349,20 @@ def build_overview_payload(short_code, file_list):
     return overview_text, InlineKeyboardMarkup(keyboard)
 
 # --- 4. 广告展示与解析 ---
-async def send_ad_to_user(chat_id, context):
+async def send_ad_to_user(chat_id, context, is_preview=False):
     ad = db_get_ad()
     if not ad:
+        if is_preview:
+            await context.bot.send_message(chat_id=chat_id, text="⚠️ 广告内容为空或未启用，无法预览。")
         return
     
     reply_markup = None
     if ad["btn_text"] and ad["btn_url"]:
+        url = ad["btn_url"].strip()
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
         reply_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton(ad["btn_text"], url=ad["btn_url"])]
+            [InlineKeyboardButton(ad["btn_text"], url=url)]
         ])
     
     try:
@@ -361,6 +382,12 @@ async def send_ad_to_user(chat_id, context):
             )
     except Exception as e:
         logging.error(f"发送广告失败: {e}")
+        if is_preview:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"❌ **广告预览发送失败**\n原因：`{e}`\n请检查按钮链接是否为有效网址或文案是否过长。",
+                parse_mode="Markdown"
+            )
 
 def parse_ad_text(raw_text):
     if not raw_text:
@@ -418,7 +445,7 @@ async def handle_incoming_text(update: Update, context: ContextTypes.DEFAULT_TYP
         caption, btn_text, btn_url = parse_ad_text(message.text)
         db_save_ad(None, caption, btn_text, btn_url)
         await message.reply_text("✅ **纯文字广告已保存至 `ad_config.json`！** 效果预览如下：")
-        await send_ad_to_user(message.chat_id, context)
+        await send_ad_to_user(message.chat_id, context, is_preview=True)
 
 async def handle_incoming_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -434,7 +461,7 @@ async def handle_incoming_document(update: Update, context: ContextTypes.DEFAULT
         file = await context.bot.get_file(document.file_id)
         await file.download_to_drive(AD_CONFIG_FILE)
         await message.reply_text("✅ **广告配置文件 `ad_config.json` 已加载生效！** 效果预览如下：")
-        await send_ad_to_user(message.chat_id, context)
+        await send_ad_to_user(message.chat_id, context, is_preview=True)
     else:
         await message.reply_text("📂 收到您的文件，但该文件不是 `.db` 数据库或 `ad_config.json` 配置文件。")
 
@@ -454,7 +481,7 @@ async def handle_incoming_media(update: Update, context: ContextTypes.DEFAULT_TY
         caption, btn_text, btn_url = parse_ad_text(message.caption or "")
         db_save_ad(photo_id, caption, btn_text, btn_url)
         await message.reply_text("✅ **图文广告已保存至 `ad_config.json`！** 效果预览如下：")
-        await send_ad_to_user(chat_id, context)
+        await send_ad_to_user(chat_id, context, is_preview=True)
         return
 
     file_size = 0
@@ -539,7 +566,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.edit_text("✅ 该组文件已经成功打包过了。")
             return
 
-        short_code = session_files[0]["file_id"][-8:]
+        short_code = generate_unique_short_code(8)
         db_save_resource(short_code, session_files)
         UPLOADING_SESSIONS[chat_id] = {"files": [], "msg_id": None}
 
@@ -660,7 +687,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if file_list:
             overview_text, reply_markup = build_overview_payload(short_code, file_list)
             await update.message.reply_text(overview_text, reply_markup=reply_markup, parse_mode="Markdown")
-            await send_ad_to_user(chat_id, context)
+            await send_ad_to_user(chat_id, context, is_preview=False)
         else:
             await update.message.reply_text("❌ 未找到该存档记录，可能已失效。")
     else:
