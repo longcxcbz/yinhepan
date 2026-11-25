@@ -1,7 +1,7 @@
 {
-  "enabled": true,
+  "enabled": false,
   "photo_id": "",
-  "caption": "🔥 精选资源每日更新，欢迎关注主频道！",
-  "btn_text": "点击加入主频道",
-  "btn_url": "https://t.me/你的频道用户名"
+  "caption": "",
+  "btn_text": "",
+  "btn_url": ""
 }
