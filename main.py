@@ -27,7 +27,7 @@ from telegram.ext import (
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 
 BOT_USERNAME = "Yinhepan_bot"
-ADMIN_USER_ID = 0
+ADMIN_USER_ID = 8790114086
 DB_FILE = "private_database.db"
 AD_CONFIG_FILE = "ad_config.json"
 
