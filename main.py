@@ -28,7 +28,7 @@ ADMIN_USER_ID = 0
 DB_FILE = "private_database.db"
 AD_CONFIG_FILE = "ad_config.json"
 
-PAGE_SIZE = 10          # 每页 10 个文件（80 个自动分 8 页，与 Telegram 媒体组上限一致）
+PAGE_SIZE = 10          # 每页 10 个文件（20 张图自动分 2 页，80 个分 8 页）
 MAX_VISIBLE_PAGES = 5   # 首批平铺显示的页码数量，超出折叠为 "6-8" 范围按钮
 
 DEFAULT_AD_CONFIG = {
@@ -38,6 +38,9 @@ DEFAULT_AD_CONFIG = {
     "btn_text": "",
     "btn_url": ""
 }
+
+# 记录每个用户对 (short_code, mode) 已获取过的页码集合：{(chat_id, short_code, mode): {1, 2}}
+FETCHED_PAGES = {}
 
 # --- 1. 数据库初始化与存档读写 ---
 def init_db():
@@ -111,7 +114,6 @@ def save_ad_config(config_dict):
     with open(AD_CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(merged, f, ensure_ascii=False, indent=2)
 
-# 启动时确保 ad_config.json 存在
 load_ad_config()
 
 def db_save_ad(photo_id, caption, btn_text, btn_url):
@@ -163,7 +165,7 @@ def run_web_server():
 
 threading.Thread(target=run_web_server, daemon=True).start()
 
-# --- 3. 分页筛选与页码键盘生成（支持 1..5 + 6-8 折叠展开） ---
+# --- 3. 分页状态与页码按钮构建 ---
 def get_filtered_files(file_list, mode):
     if mode == "photo":
         return [x for x in file_list if x["type"] == "photo"]
@@ -174,44 +176,80 @@ def get_filtered_files(file_list, mode):
 def get_mode_label(mode):
     return {"all": "全部文件", "photo": "仅看图片", "video": "仅看视频"}.get(mode, "全部文件")
 
-def build_pagination_keyboard(short_code, mode, total_pages, range_start=1, expand_range=False):
+def mark_page_fetched(chat_id, short_code, mode, page_num):
+    key = (chat_id, short_code, mode)
+    if key not in FETCHED_PAGES:
+        FETCHED_PAGES[key] = set()
+    FETCHED_PAGES[key].add(page_num)
+
+def get_fetched_set(chat_id, short_code, mode):
+    return FETCHED_PAGES.get((chat_id, short_code, mode), set())
+
+def format_page_label(page_num, current_page, fetched_set):
+    if page_num == current_page:
+        return f"📍{page_num}"
+    if page_num in fetched_set:
+        return f"✅{page_num}"
+    return f"{page_num}"
+
+def build_page_keyboard(chat_id, short_code, mode, total_pages, current_page, range_start=1, expand_range=False):
+    fetched_set = get_fetched_set(chat_id, short_code, mode)
     keyboard = []
-    
+
     if total_pages <= MAX_VISIBLE_PAGES:
         row = [
-            InlineKeyboardButton(f"{p}", callback_data=f"page|{mode}|{short_code}|{p}")
+            InlineKeyboardButton(
+                format_page_label(p, current_page, fetched_set),
+                callback_data=f"page|{mode}|{short_code}|{p}|0|0"
+            )
             for p in range(1, total_pages + 1)
         ]
         keyboard.append(row)
     else:
         if not expand_range:
-            # 第一排：1, 2, 3, 4, 5
             first_row = [
-                InlineKeyboardButton(f"{p}", callback_data=f"page|{mode}|{short_code}|{p}")
+                InlineKeyboardButton(
+                    format_page_label(p, current_page, fetched_set),
+                    callback_data=f"page|{mode}|{short_code}|{p}|0|0"
+                )
                 for p in range(1, MAX_VISIBLE_PAGES + 1)
             ]
             keyboard.append(first_row)
-            
-            # 第二排：剩余页码折叠为 "6-8" 等范围按钮
+
             rem_start = MAX_VISIBLE_PAGES + 1
             range_row = []
             while rem_start <= total_pages:
                 rem_end = min(rem_start + MAX_VISIBLE_PAGES - 1, total_pages)
-                label = f"{rem_start}-{rem_end}" if rem_start != rem_end else f"{rem_start}"
+                base_label = f"{rem_start}-{rem_end}" if rem_start != rem_end else f"{rem_start}"
+                range_pages = set(range(rem_start, rem_end + 1))
+                if current_page in range_pages:
+                    label = f"📍{base_label}"
+                elif range_pages & fetched_set:
+                    label = f"✅{base_label}"
+                else:
+                    label = base_label
                 range_row.append(
-                    InlineKeyboardButton(label, callback_data=f"range|{mode}|{short_code}|{rem_start}|{rem_end}")
+                    InlineKeyboardButton(
+                        label,
+                        callback_data=f"range|{mode}|{short_code}|{current_page}|{rem_start}|{rem_end}"
+                    )
                 )
                 rem_start = rem_end + 1
             keyboard.append(range_row)
         else:
-            # 展开指定区间（如 6, 7, 8）并附带返回 1-5 按钮
             expanded_row = [
-                InlineKeyboardButton(f"{p}", callback_data=f"page|{mode}|{short_code}|{p}")
+                InlineKeyboardButton(
+                    format_page_label(p, current_page, fetched_set),
+                    callback_data=f"page|{mode}|{short_code}|{p}|{range_start}|1"
+                )
                 for p in range(range_start, min(range_start + MAX_VISIBLE_PAGES, total_pages + 1))
             ]
             keyboard.append(expanded_row)
             keyboard.append([
-                InlineKeyboardButton("↩️ 返回 1-5 页码", callback_data=f"pagepanel|{mode}|{short_code}|1|0")
+                InlineKeyboardButton(
+                    "↩️ 返回 1-5 页码",
+                    callback_data=f"page|{mode}|{short_code}|{current_page}|1|0"
+                )
             ])
 
     keyboard.append([
@@ -219,7 +257,7 @@ def build_pagination_keyboard(short_code, mode, total_pages, range_start=1, expa
     ])
     return InlineKeyboardMarkup(keyboard)
 
-async def send_single_page(chat_id, context, file_list, mode, page_num):
+async def send_page_with_bar(chat_id, context, file_list, short_code, mode, page_num, range_start=1, expand_range=False):
     filtered = get_filtered_files(file_list, mode)
     total_items = len(filtered)
     if total_items == 0:
@@ -231,15 +269,11 @@ async def send_single_page(chat_id, context, file_list, mode, page_num):
         await context.bot.send_message(chat_id=chat_id, text="❌ 页码超出范围。")
         return
 
+    mark_page_fetched(chat_id, short_code, mode, page_num)
+
     start_idx = (page_num - 1) * PAGE_SIZE
     end_idx = min(start_idx + PAGE_SIZE, total_items)
     chunk = filtered[start_idx:end_idx]
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"📄 正在发送「{get_mode_label(mode)}」第 **{page_num}/{total_pages}** 页（第 {start_idx + 1}～{end_idx} 个，共 {total_items} 个）...",
-        parse_mode="Markdown"
-    )
 
     media = [
         InputMediaPhoto(media=x["file_id"]) if x["type"] == "photo" 
@@ -250,6 +284,22 @@ async def send_single_page(chat_id, context, file_list, mode, page_num):
         await context.bot.send_media_group(chat_id=chat_id, media=media)
     except Exception as e:
         await context.bot.send_message(chat_id=chat_id, text=f"❌ 下发出错: {e}")
+        return
+
+    fetched_set = get_fetched_set(chat_id, short_code, mode)
+    fetched_str = "、".join(str(p) for p in sorted(fetched_set)) if fetched_set else "无"
+    bar_text = (
+        f"📄 **{get_mode_label(mode)}** · 当前第 **{page_num}/{total_pages}** 页（第 {start_idx + 1}～{end_idx} 个，共 {total_items} 个）\n"
+        f"📍 当前页：`📍{page_num}` ｜ ✅ 已获取：{fetched_str}\n"
+        f"👇 点击下方页码切换或继续获取："
+    )
+    markup = build_page_keyboard(
+        chat_id, short_code, mode, total_pages,
+        current_page=page_num,
+        range_start=range_start,
+        expand_range=expand_range
+    )
+    await context.bot.send_message(chat_id=chat_id, text=bar_text, reply_markup=markup, parse_mode="Markdown")
 
 def build_overview_payload(short_code, file_list):
     total_count = len(file_list)
@@ -268,16 +318,16 @@ def build_overview_payload(short_code, file_list):
         f"🔑 识别码：`{short_code}`\n"
         f"🖼️ 图片数量：**{photo_count}** 个\n"
         f"🎬 视频数量：**{video_count}** 个\n"
-        f"📦 总文件数：**{total_count}** 个（共 **{total_pages}** 页，每页 {PAGE_SIZE} 个）\n"
+        f"📦 总文件数：**{total_count}** 个（全部共 **{total_pages}** 页，每页 {PAGE_SIZE} 个）\n"
         f"💾 估计总容量：**{size_str}**\n\n"
-        f"👇 **请选择浏览方式并点击页码：**"
+        f"👇 **点击下方按钮直接获取第 1 页内容：**"
     )
 
     keyboard = [
-        [InlineKeyboardButton(f"📑 全部文件选页 ({total_count}个 / {total_pages}页)", callback_data=f"pagepanel|all|{short_code}|1|0")],
+        [InlineKeyboardButton(f"📑 全部第 1 页 ({total_count}个 / {total_pages}页)", callback_data=f"page|all|{short_code}|1|0|0")],
         [
-            InlineKeyboardButton(f"🖼️ 图片选页 ({photo_count}个)", callback_data=f"pagepanel|photo|{short_code}|1|0"),
-            InlineKeyboardButton(f"🎬 视频选页 ({video_count}个)", callback_data=f"pagepanel|video|{short_code}|1|0")
+            InlineKeyboardButton(f"🖼️ 图片第 1 页 ({photo_count}个)", callback_data=f"page|photo|{short_code}|1|0|0"),
+            InlineKeyboardButton(f"🎬 视频第 1 页 ({video_count}个)", callback_data=f"page|video|{short_code}|1|0|0")
         ]
     ]
     return overview_text, InlineKeyboardMarkup(keyboard)
@@ -526,51 +576,37 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raw_link = f"https://t.me/{BOT_USERNAME}?start={code}"
             await query.message.reply_text(f"📌 存档 `{code}`\n总数：{len(file_list)}个\n链接：\n`{raw_link}`", parse_mode="Markdown")
 
-    elif data.startswith("pagepanel|"):
-        _, mode, code, start_s, expand_s = data.split("|")
+    elif data.startswith("page|"):
+        _, mode, code, page_s, range_start_s, expand_s = data.split("|")
         file_list = db_get_resource(code)
         if not file_list:
-            await query.message.edit_text("❌ 存档已失效。")
+            await query.message.reply_text("❌ 存档已失效。")
             return
-        filtered = get_filtered_files(file_list, mode)
-        if not filtered:
-            await query.message.edit_text(f"📂 该存档中没有「{get_mode_label(mode)}」内容。")
-            return
-        total_pages = math.ceil(len(filtered) / PAGE_SIZE)
-        text = (
-            f"📑 **选择页码（{get_mode_label(mode)}）**\n"
-            f"🔑 识别码：`{code}`\n"
-            f"📦 符合条件共 **{len(filtered)}** 个文件，分为 **{total_pages}** 页（每页 {PAGE_SIZE} 个）\n\n"
-            f"👇 点击下方页码获取对应内容："
-        )
-        markup = build_pagination_keyboard(
-            code, mode, total_pages,
-            range_start=int(start_s),
+        await send_page_with_bar(
+            chat_id, context, file_list, code, mode,
+            page_num=int(page_s),
+            range_start=int(range_start_s) or 1,
             expand_range=(expand_s == "1")
         )
-        await query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
 
     elif data.startswith("range|"):
-        _, mode, code, rem_start_s, rem_end_s = data.split("|")
+        _, mode, code, cur_page_s, rem_start_s, rem_end_s = data.split("|")
         file_list = db_get_resource(code)
         if not file_list:
             await query.message.edit_text("❌ 存档已失效。")
             return
         filtered = get_filtered_files(file_list, mode)
         total_pages = math.ceil(len(filtered) / PAGE_SIZE)
+        cur_page = int(cur_page_s)
         rem_start = int(rem_start_s)
         rem_end = int(rem_end_s)
-        text = (
-            f"📑 **选择页码（{get_mode_label(mode)} · 第 {rem_start}～{rem_end} 页）**\n"
-            f"🔑 识别码：`{code}`\n\n"
-            f"👇 点击下方具体页码获取文件："
-        )
-        markup = build_pagination_keyboard(
-            code, mode, total_pages,
+        markup = build_page_keyboard(
+            chat_id, code, mode, total_pages,
+            current_page=cur_page,
             range_start=rem_start,
             expand_range=True
         )
-        await query.message.edit_text(text, reply_markup=markup, parse_mode="Markdown")
+        await query.message.edit_reply_markup(reply_markup=markup)
 
     elif data.startswith("backoverview|"):
         _, code = data.split("|")
@@ -580,14 +616,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         overview_text, markup = build_overview_payload(code, file_list)
         await query.message.edit_text(overview_text, reply_markup=markup, parse_mode="Markdown")
-
-    elif data.startswith("page|"):
-        _, mode, code, page_s = data.split("|")
-        file_list = db_get_resource(code)
-        if not file_list:
-            await query.message.reply_text("❌ 存档已失效。")
-            return
-        await send_single_page(chat_id, context, file_list, mode, int(page_s))
 
 async def glwj_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ADMIN_USER_ID != 0 and update.effective_user.id != ADMIN_USER_ID:
